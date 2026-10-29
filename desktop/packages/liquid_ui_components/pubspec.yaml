@@ -1,0 +1,30 @@
+name: liquid_ui_components
+description: Configurable liquid glass controls for Flutter with optical surfaces, buttons, toolbars, segments, sliders, switches and spring-animated navigation.
+version: 0.3.0-dev.1
+repository: https://github.com/veha2309/liquid_ui_components
+issue_tracker: https://github.com/veha2309/liquid_ui_components/issues
+topics:
+  - navigation
+  - liquid-glass
+  - android
+  - widgets
+  - ui
+
+environment:
+  sdk: '>=3.12.2 <4.0.0'
+  flutter: '>=3.44.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  liquid_glass_easy: 3.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+platforms:
+  android:
+
+flutter:
+  shaders:
+    - shaders/liquid_glass.frag

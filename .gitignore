@@ -1,0 +1,32 @@
+/target/
+/release/
+*.log
+*.db*
+oauth-client.json
+client_secret*.json
+*.dpapi
+.env
+/.tools/
+
+# Personal configuration, credentials, and runtime state
+.env.*
+!.env.example
+credentials*.json
+token*.json
+*.pem
+*.pfx
+*.p12
+*.key
+*.sqlite*
+*.journal
+*.patch
+
+# Generated package tooling and native build output
+**/.dart_tool/
+**/build/
+**/coverage/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/ephemeral/
+**/.pub-cache/
+**/.pub/
