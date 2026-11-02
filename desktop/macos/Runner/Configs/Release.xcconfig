@@ -1,0 +1,5 @@
+#include "../../Flutter/Flutter-Release.xcconfig"
+#include "Warnings.xcconfig"
+
+// Match the Rust engine bundled by build-macos.sh on the build machine.
+ARCHS = $(NATIVE_ARCH_ACTUAL)

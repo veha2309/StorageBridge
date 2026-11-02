@@ -34,7 +34,7 @@ void main() {
     await tester.pumpWidget(const StorageBridgeApp());
     await tester.pumpAndSettle();
     expect(find.text('Connect your Google account'), findsOneWidget);
-    expect(find.text('Get WinFsp'), findsOneWidget);
+    expect(find.text(usesMacOS ? 'Get macFUSE' : 'Get WinFsp'), findsOneWidget);
     expect(find.text('Import OAuth client'), findsOneWidget);
     expect(find.byType(LiquidGlassNavigationBar), findsOneWidget);
     expect(find.byType(LiquidGlassButton), findsWidgets);

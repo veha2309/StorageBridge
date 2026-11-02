@@ -91,8 +91,21 @@ impl Engine {
             read_views: HashMap::new(),
         })
     }
-    pub fn root_id(&self) -> String {
-        self.store.setting("root_id").unwrap_or("root".into())
+    pub fn root_id(&self) -> Result<String> {
+        self.store
+            .setting("root_id")
+            .context("Root metadata is missing (root_id not set); the drive must be reinitialized")
+    }
+
+    pub fn root_node(&self) -> Result<Node> {
+        let id = self.root_id()?;
+        let node = self
+            .store
+            .get(&id)
+            .with_context(|| format!("Root node '{id}' is missing from the metadata store"))?;
+        ensure!(node.directory, "Root node '{id}' is not a directory");
+        ensure!(!node.deleted, "Root node '{id}' is marked deleted");
+        Ok(node)
     }
     pub fn configure_scope(&mut self, name: &str) -> Result<()> {
         if self.store.setting("scope_folder").as_deref() == Some(name) {
@@ -177,7 +190,7 @@ impl Engine {
         if self.store.setting("scope_folder").is_none() {
             return Ok(true);
         }
-        let root = self.root_id();
+        let root = self.root_id()?;
         if node.id == root {
             return Ok(true);
         }
@@ -210,6 +223,14 @@ impl Engine {
             .context("Google Drive root was not found")?;
         let mut root = self.scoped_root(account_root)?;
         ensure!(root.directory, "The mount root must be a folder");
+        let stored_ok = matches!(
+            self.store.setting("root_id"),
+            Some(id) if id == root.id
+                && self.store.get(&id).map(|n| n.directory && !n.deleted).unwrap_or(false)
+        );
+        if !stored_ok {
+            self.reset_metadata()?;
+        }
         root.alias = "".into();
         self.store.set("root_id", &root.id)?;
         self.store.put(&root)?;
@@ -219,6 +240,30 @@ impl Engine {
         }
         let about = self.remote.about()?;
         self.store.set("about", &about.to_string())?;
+        Ok(())
+    }
+    fn reset_metadata(&mut self) -> Result<()> {
+        let pending: u32 = self
+            .store
+            .db
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))?;
+        ensure!(
+            pending == 0 && self.store.all()?.iter().all(|n| !n.dirty),
+            "Root metadata is invalid but pending uploads exist; refusing to discard them"
+        );
+        for node in self.store.all()? {
+            let p = self.cache(&node.id);
+            if p.exists() {
+                std::fs::remove_file(p)?;
+            }
+        }
+        let tx = self.store.db.transaction()?;
+        tx.execute("DELETE FROM nodes", [])?;
+        tx.execute(
+            "DELETE FROM settings WHERE key IN ('root_id','cursor') OR key LIKE 'listed:%'",
+            [],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn cache(&self, id: &str) -> PathBuf {
@@ -322,7 +367,7 @@ impl Engine {
         self.children(parent)
     }
     pub fn resolve(&mut self, path: &str) -> Result<Node> {
-        let mut current = self.store.get(&self.root_id())?;
+        let mut current = self.root_node()?;
         for part in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
             ensure!(
                 part != "." && part != ".." && !part.contains(':'),
@@ -515,7 +560,7 @@ impl Engine {
     }
     pub fn can_delete(&mut self, id: &str) -> Result<()> {
         let n = self.store.get(id)?;
-        ensure!(n.id != self.root_id(), "Cannot delete the drive root");
+        ensure!(n.id != self.root_id()?, "Cannot delete the drive root");
         if n.directory {
             ensure!(self.list(id)?.is_empty(), "Directory is not empty");
         }
@@ -531,10 +576,11 @@ impl Engine {
         let (parent, name) = split(path)?;
         let parent = self.resolve(parent)?;
         let mut n = self.store.get(id)?;
-        ensure!(parent.directory && n.id != self.root_id(), "Invalid rename");
+        let root_id = self.root_id()?;
+        ensure!(parent.directory && n.id != root_id, "Invalid rename");
         let mut ancestor = parent.clone();
         let mut seen = HashSet::new();
-        while ancestor.id != self.root_id() {
+        while ancestor.id != root_id {
             ensure!(
                 ancestor.id != id && seen.insert(ancestor.id.clone()),
                 "Cannot move a directory into itself"
@@ -834,6 +880,9 @@ impl Engine {
         if self.store.setting("cursor").is_none() {
             return self.initialize();
         }
+        let root_id = self.root_id()?;
+        self.root_node()
+            .context("Root metadata is invalid; reinitialize before polling")?;
         let pending: Vec<_> = self.refresh.iter().cloned().collect();
         for id in pending {
             if self.open.get(&id).copied().unwrap_or(0) == 0 {
@@ -848,7 +897,7 @@ impl Engine {
         let cursor = self.store.setting("cursor").unwrap();
         let (changes, next) = self.remote.changes(&cursor)?;
         for (id, n) in changes {
-            if id == self.root_id() && n.is_none() {
+            if id == root_id && n.is_none() {
                 anyhow::bail!("The StorageBridge folder was removed. Restore it in Google Drive.");
             }
             if let Some(n) = n

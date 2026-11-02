@@ -168,6 +168,9 @@ impl Auth {
             ("code_challenge", challenge.as_str()),
             ("code_challenge_method", "S256"),
         ]);
+        #[cfg(target_os = "macos")]
+        crate::platform::open_browser(url.as_str())?;
+        #[cfg(not(target_os = "macos"))]
         webbrowser::open(url.as_str()).context("Could not open the system browser")?;
         let deadline = Instant::now() + Duration::from_secs(180);
         let code = loop {
@@ -276,6 +279,10 @@ impl Auth {
     }
 }
 pub fn save_secret(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::save_secret(path, bytes)
+    }
     #[cfg(windows)]
     {
         let encrypted = crate::platform::protect(bytes, false)?;
@@ -289,18 +296,22 @@ pub fn save_secret(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         crate::platform::replace_file(&staging, path)?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (path, bytes);
         bail!("Credential storage is not implemented for this platform")
     }
 }
 pub(crate) fn load_secret(path: &std::path::Path) -> Result<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::load_secret(path)
+    }
     #[cfg(windows)]
     {
         crate::platform::protect(&std::fs::read(path)?, true)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         bail!("Credential storage is not implemented for this platform")

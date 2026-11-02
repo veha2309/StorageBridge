@@ -134,7 +134,8 @@ impl Runtime {
     pub fn resolve(&self, path: &str) -> Result<Node> {
         let mut current = {
             let e = self.engine.lock();
-            e.store.get(&e.root_id())?
+            let root_id = e.root_id()?;
+            e.store.get(&root_id)?
         };
         for part in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
             ensure!(
@@ -462,8 +463,9 @@ impl Runtime {
             }
         }
         let (changes, next) = worker.remote.changes(&cursor)?;
+        let root_id = worker.root_id()?;
         for (id, node) in changes {
-            if id == worker.root_id() && node.is_none() {
+            if id == root_id && node.is_none() {
                 anyhow::bail!("The StorageBridge folder was removed. Restore it in Google Drive.");
             }
             let included = node

@@ -58,3 +58,27 @@ Tests cover durable queued edits, offline restart/retry, interrupted download cl
 The mounted-drive test uses the isolated local remote, not a Google account. It performs real Windows filesystem operations for create, read, write, replacement, rename, enumeration, deletion, and unmount. It does not claim validation in Office or other specific editors.
 
 Still requiring user configuration/manual validation: live Google browser consent, token refresh against Google, uploads/downloads in My Drive/StorageBridge, real Google quota/revocation behavior, startup reconnect with authenticated credentials, power-loss/disk-exhaustion testing on a disposable volume, cross-device synchronization, and macOS integration. Version checks preserve detected conflicts but do not provide a distributed lock for concurrent editors.
+
+
+## macOS adapter validation (2026-10-29)
+
+Added macFUSE mounting, Keychain-backed credentials, user-only Unix IPC and instance locking, LaunchAgent startup reconnect, a Swift Flutter runner with menu bar controls, Finder-specific UI, native-architecture packaging, and an isolated mounted-drive smoke script.
+
+Checked on Apple Silicon with Rust 1.99.1, Flutter 3.44.6 / Dart 3.12.2, and Xcode:
+
+- `cargo check --all-targets`: passed.
+- All 53 Rust tests passed, including the macOS adapter and daemon integration tests. HTTP fixtures used local loopback servers, without Google credentials.
+- macOS daemon integration exercised private Unix socket requests, duplicate-instance rejection, protocol-version rejection, settings persistence, shutdown, and restart. It used a temporary home directory and a separate demo instance.
+- Rust Clippy with warnings denied: passed.
+- Flutter analysis and both widget tests: passed.
+- Flutter macOS debug and native arm64 release builds: passed.
+- Shell syntax checks for both new macOS scripts: passed.
+- Packaged `release/StorageBridge.app` and `release/StorageBridge-macos-arm64.zip`; ad-hoc code-signature verification passed. Mounting requires a separate macFUSE installation; the engine can start without it.
+
+The macFUSE 5.4.0 package was extracted under `/tmp` solely for build/link libraries. Neither its filesystem extension nor its system installation was activated. Mount setup uses the public libfuse3 session API and a duplicated device descriptor, rather than the libfuse2 mount entry point disabled in macFUSE 5.3+ (https://github.com/cberner/fuser/issues/752). Kernel initialization is required before a mount reports success. The Rust test runs used the extracted library and framework via `DYLD_LIBRARY_PATH` / `DYLD_FRAMEWORK_PATH`, and pkgconf was built under `/tmp`. Those test environment paths are not part of the application or build scripts.
+
+Still unverified: a live macFUSE mount (including `scripts/smoke-mount-macos.sh`), Finder/application save patterns, real Keychain access and consent, Google OAuth, startup reconnect after login, Intel hardware, Developer ID signing/notarization, and Windows regression testing. The Windows-specific `dpapi_roundtrip` test is a no-op on macOS; it does not validate Keychain. Do not treat compile checks or shared-engine tests as evidence of those native workflows.
+
+Follow-up startup fix: reproduced and removed a hard dyld dependency on `libfuse.2.dylib` by weak-linking the unused fuser mount library. The packaged engine now passes `--diagnose` without macFUSE installed. The daemon integration test removes temporary DYLD overrides and passes startup, IPC, shutdown, and restart checks. Flutter analysis, both widget tests, release rebuild, and package signature verification also passed. Corrected remaining Windows drive/startup labels on macOS.
+
+Browser-launch follow-up: macOS now invokes `/usr/bin/open` from the headless daemon rather than AppKit browser APIs on its background login thread. The launcher has a ten-second timeout and returns actionable failure messages. Tests cover successful launcher exit, unsuccessful exit, and terminating a stalled launcher; all five platform tests and Clippy passed. The arm64 engine/package was rebuilt and signed. Real Google browser authorization remains unverified.

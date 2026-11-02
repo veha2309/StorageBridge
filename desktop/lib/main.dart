@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
-
+import 'dart:io' show Platform;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:liquid_ui_components/liquid_ui_components.dart';
 
+final usesMacOS = Platform.isMacOS;
 const native = MethodChannel('dev.storagebridge/desktop');
 void main() => runApp(const StorageBridgeApp());
 
@@ -75,11 +77,15 @@ class _DashboardState extends State<Dashboard> {
   bool busy = false, refreshing = false;
   Timer? timer;
   final cache = TextEditingController(text: '10');
+  String _version = '';
 
   @override
   void initState() {
     super.initState();
     refresh();
+    PackageInfo.fromPlatform().then((info) {
+    if (mounted) setState(() => _version = info.version);
+  });
     timer = Timer.periodic(const Duration(seconds: 2), (_) => refresh());
   }
 
@@ -119,7 +125,8 @@ class _DashboardState extends State<Dashboard> {
       if (mounted && status != null) {
         setState(() {
           status = null;
-          error = 'Background engine disconnected. Start it again to reconnect; pending files remain on this PC.';
+          error =
+              'Background engine disconnected. Start it again to reconnect; pending files remain on this PC.';
         });
       }
     } finally {
@@ -164,7 +171,8 @@ class _DashboardState extends State<Dashboard> {
 
   Future<void> start(bool demo) => act(() async {
     await native.invokeMethod<void>('launch', demo);
-    for (var i = 0; i < 25; i++) {
+    String? startupError;
+    for (var i = 0; i < (usesMacOS ? 150 : 25); i++) {
       await Future<void>.delayed(const Duration(milliseconds: 200));
       try {
         final next = await request('status');
@@ -172,10 +180,14 @@ class _DashboardState extends State<Dashboard> {
           acceptStatus(next);
         }
         return;
-      } catch (_) {}
+      } catch (e) {
+        startupError = e is PlatformException ? e.message : e.toString();
+      }
     }
     throw Exception(
-      'Engine did not start. Check that storage-bridge.exe is beside the desktop app.',
+      usesMacOS
+          ? 'Engine is not responding. ${startupError ?? 'Try starting it again.'}'
+          : 'Engine did not start. Check that storage-bridge.exe is beside the desktop app.',
     );
   });
   Future<void> importClient() => act(() async {
@@ -249,16 +261,18 @@ class _DashboardState extends State<Dashboard> {
                         ),
                       ),
                       const Spacer(),
-                      const Padding(
-                        padding: EdgeInsets.all(24),
+                      Padding(
+                        padding: const EdgeInsets.all(24),
                         child: Text(
-                          'Windows preview · v0.3.0\nCustom Rust storage engine',
-                          style: TextStyle(
-                            color: Color(0xff9baab4),
-                            height: 1.8,
-                            fontSize: 11,
-                          ),
-                        ),
+  '${usesMacOS ? 'macOS' : 'Windows'} preview'
+  '${_version.isEmpty ? '' : ' · v$_version'}'
+  '\nCustom Rust storage engine',
+  style: TextStyle(
+    color: Color(0xff9baab4),
+    height: 1.8,
+    fontSize: 11,
+  ),
+),
                       ),
                     ],
                   ),
@@ -357,7 +371,7 @@ class _DashboardState extends State<Dashboard> {
                           ),
                           statusTile(
                             Icons.folder_outlined,
-                            'WINDOWS DRIVE',
+                            usesMacOS ? 'FINDER DRIVE' : 'WINDOWS DRIVE',
                             mountedDrive
                                 ? (s['drive_letter']?.toString() ?? letter)
                                 : 'Not mounted',
@@ -519,7 +533,7 @@ class _DashboardState extends State<Dashboard> {
                         ],
                       ),
                       const SizedBox(height: 20),
-                      panel('Your Windows drive', [
+                      panel(usesMacOS ? 'Your Finder drive' : 'Your Windows drive', [
                         Text(
                           s['demo'] == true
                               ? 'Isolated local test drive — no Google connection.'
@@ -527,8 +541,8 @@ class _DashboardState extends State<Dashboard> {
                           style: const TextStyle(fontWeight: FontWeight.w600),
                         ),
                         const SizedBox(height: 10),
-                        const Text(
-                          'Browse files in File Explorer. Keep the engine running until uploads finish.',
+                        Text(
+                          'Browse files in ${usesMacOS ? 'Finder' : 'File Explorer'}. Keep the engine running until uploads finish.',
                         ),
                         const SizedBox(height: 20),
                         Wrap(
@@ -536,25 +550,28 @@ class _DashboardState extends State<Dashboard> {
                           runSpacing: 12,
                           crossAxisAlignment: WrapCrossAlignment.center,
                           children: [
-                            SizedBox(
-                              width: 130,
-                              child: DropdownButtonFormField<String>(
-                                initialValue: letter,
-                                decoration: const InputDecoration(
-                                  labelText: 'Drive letter',
+                            if (!usesMacOS)
+                              SizedBox(
+                                width: 130,
+                                child: DropdownButtonFormField<String>(
+                                  initialValue: letter,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Drive letter',
+                                  ),
+                                  items: [
+                                    for (var c = 68; c <= 90; c++)
+                                      DropdownMenuItem(
+                                        value: '${String.fromCharCode(c)}:',
+                                        child: Text(
+                                          '${String.fromCharCode(c)}:',
+                                        ),
+                                      ),
+                                  ],
+                                  onChanged: mountedDrive
+                                      ? null
+                                      : (v) => setState(() => letter = v!),
                                 ),
-                                items: [
-                                  for (var c = 68; c <= 90; c++)
-                                    DropdownMenuItem(
-                                      value: '${String.fromCharCode(c)}:',
-                                      child: Text('${String.fromCharCode(c)}:'),
-                                    ),
-                                ],
-                                onChanged: mountedDrive
-                                    ? null
-                                    : (v) => setState(() => letter = v!),
                               ),
-                            ),
                             glassAction(
                               onPressed: busy || !connected
                                   ? null
@@ -577,24 +594,34 @@ class _DashboardState extends State<Dashboard> {
                                   'openDrive',
                                   s['drive_letter'],
                                 ),
-                                child: const Text('Open File Explorer'),
+                                child: Text(
+                                  usesMacOS
+                                      ? 'Open Finder'
+                                      : 'Open File Explorer',
+                                ),
                               ),
                           ],
                         ),
-                        if (s['winfsp_installed'] != true)
+                        if ((s['filesystem_available'] ??
+                                s['winfsp_installed']) !=
+                            true)
                           Padding(
                             padding: const EdgeInsets.only(top: 16),
                             child: Wrap(
                               crossAxisAlignment: WrapCrossAlignment.center,
                               spacing: 12,
                               children: [
-                                const Text(
-                                  'WinFsp is required to mount a Windows drive.',
+                                Text(
+                                  usesMacOS
+                                      ? 'macFUSE is required to mount a Finder drive.'
+                                      : 'WinFsp is required to mount a Windows drive.',
                                 ),
                                 TextButton(
                                   onPressed: () =>
                                       native.invokeMethod<void>('openWinfsp'),
-                                  child: const Text('Get WinFsp'),
+                                  child: Text(
+                                    usesMacOS ? 'Get macFUSE' : 'Get WinFsp',
+                                  ),
                                 ),
                               ],
                             ),
@@ -752,8 +779,8 @@ class _DashboardState extends State<Dashboard> {
                         ),
                         GlassSwitchTile(
                           contentPadding: EdgeInsets.zero,
-                          title: const Text(
-                            'Reconnect when I sign in to Windows',
+                          title: Text(
+                            'Reconnect when I sign in to ${usesMacOS ? 'macOS' : 'Windows'}',
                           ),
                           subtitle: const Text(
                             'Start the engine and mount the last selected drive.',

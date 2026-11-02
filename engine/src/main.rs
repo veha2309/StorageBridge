@@ -15,11 +15,11 @@ fn main() {
         std::process::exit(1);
     }
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run() -> Result<()> {
-    anyhow::bail!("The daemon currently supports Windows only; shared engine code is portable")
+    anyhow::bail!("The daemon supports Windows and macOS; shared engine code is portable")
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run() -> Result<()> {
     use storage_bridge::platform::{self, filesystem, ipc};
     let args: Vec<_> = std::env::args().collect();
@@ -50,7 +50,7 @@ fn run() -> Result<()> {
     if args.iter().any(|a| a == "--diagnose") {
         println!(
             "{}",
-            json!({"platform":"windows","winfsp_installed":filesystem::available(),"pipe":ipc::pipe_name()?})
+            json!({"platform":std::env::consts::OS,"winfsp_installed":filesystem::available(),"pipe":ipc::pipe_name()?})
         );
         return Ok(());
     }
@@ -68,6 +68,11 @@ fn run() -> Result<()> {
             "google".into()
         });
     std::fs::create_dir_all(&root)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
     let auth = Arc::new(Auth::new(root.clone())?);
     let google = GoogleDrive::new(auth.clone())?;
     let progress = google.progress.clone();
@@ -142,6 +147,10 @@ fn run() -> Result<()> {
         }
     }
     ipc::serve(move |request| {
+        #[cfg(target_os = "macos")]
+        if host.as_ref().is_some_and(|h| !h.is_mounted()) {
+            host = None;
+        }
         let mut action = || -> Result<Value> {
             ensure!(request["version"] == 1, "Unsupported IPC protocol version");
             let method = request["method"].as_str().context("Missing method")?;
@@ -168,6 +177,12 @@ fn run() -> Result<()> {
                     s["login_state"] = json!(*auth.login_state.lock());
                     s["mounted"] = json!(host.is_some());
                     s["winfsp_installed"] = json!(filesystem::available());
+                    s["filesystem_available"] = json!(filesystem::available());
+                    s["platform"] = json!(std::env::consts::OS);
+                    #[cfg(target_os = "macos")]
+                    {
+                        s["drive_letter"] = json!(filesystem::mount_path());
+                    }
                     s["demo"] = json!(demo);
                     Ok(s)
                 }
@@ -198,7 +213,10 @@ fn run() -> Result<()> {
                 "mount" => {
                     ensure!(host.is_none(), "Drive is already mounted");
                     ensure!(demo || auth.connected(), "Sign in first");
+                    #[cfg(windows)]
                     let letter = p["letter"].as_str().unwrap_or("G:").to_uppercase();
+                    #[cfg(target_os = "macos")]
+                    let letter = filesystem::mount_path();
                     if engine.lock().store.setting("root_id").is_none() {
                         runtime.initialize()?;
                     }
@@ -211,10 +229,16 @@ fn run() -> Result<()> {
                         engine.lock().open.is_empty(),
                         "Files are still open; close them before unmounting"
                     );
-                    if let Some(mut h) = host.take() {
-                        h.stop();
-                        h.unmount();
+                    if let Some(h) = host.as_mut() {
+                        #[cfg(windows)]
+                        {
+                            h.stop();
+                            h.unmount();
+                        }
+                        #[cfg(target_os = "macos")]
+                        h.unmount()?;
                     }
+                    host = None;
                     Ok(json!({}))
                 }
                 "settings" => {
@@ -265,10 +289,16 @@ fn run() -> Result<()> {
                         "Pending uploads remain; retry or wait before stopping"
                     );
                     drop(e);
-                    if let Some(mut h) = host.take() {
-                        h.stop();
-                        h.unmount();
+                    if let Some(h) = host.as_mut() {
+                        #[cfg(windows)]
+                        {
+                            h.stop();
+                            h.unmount();
+                        }
+                        #[cfg(target_os = "macos")]
+                        h.unmount()?;
                     }
+                    host = None;
                     std::thread::spawn(|| {
                         std::thread::sleep(Duration::from_millis(500));
                         std::process::exit(0);

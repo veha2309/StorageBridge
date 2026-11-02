@@ -1,10 +1,10 @@
 # Storage Bridge
 
-**Use Google Drive as a Windows drive with on-demand streaming reads and durable background writes.**
+**Use Google Drive as a Windows or macOS drive with on-demand streaming reads and durable background writes.**
 
 Storage Bridge is a Windows-first personal cloud-drive preview built with Flutter/Dart, Rust, SQLite, and WinFsp. Mount **My Drive/StorageBridge** as a drive letter (default `G:`), browse in File Explorer, and open or edit files with normal Windows applications. The custom engine talks directly to Google Drive; it needs no rclone installation or hosted backend.
 
-**Current version: 0.3.0. Windows x64 only.** The Rust core separates provider and platform code for future reuse, but macOS integration and testing are deferred. This is an experimental filesystem preview, not a claim of production-ready or simultaneous multi-device editing support.
+**Current version: 0.3.0. Windows x64, with a new macOS adapter.** macOS uses macFUSE, Keychain, a Unix socket, and a native menu bar bridge. Live macOS mounting and Google sign-in still require validation. This is an experimental filesystem preview, not a claim of production-ready or simultaneous multi-device editing support.
 
 ## Features
 
@@ -37,7 +37,7 @@ Google Drive REST API: metadata, ranged reads, resumable uploads, change feed
 
 The engine continues running when the UI closes to the tray. Network reads, uploads, and change polling execute without holding the shared metadata mutex during requests. WinFsp dispatches content and directory work through separate queues to keep known-folder browsing responsive.
 
-## Run
+## Run on Windows
 
 Build the project using the instructions below, then open `release/StorageBridge/storage_bridge.exe` or install `release/StorageBridge-Setup-0.3.0-x64.exe`. Compiled applications, installers, and toolchains are excluded from Git. WinFsp must be installed to mount a drive; the app checks for it. Build targets Windows x64.
 
@@ -85,7 +85,7 @@ The cache is bound to one Google account. Reauthorization with a different accou
 Prerequisites:
 
 - Windows x64; Rust stable **1.88+** (edition 2024 and let chains).
-- Flutter stable with Dart 3.13.4+ and Windows desktop artifacts.
+- Flutter stable with Dart 3.12.2+ and Windows desktop artifacts.
 - Visual Studio 2022 with Desktop development with C++, a Windows SDK, and CMake.
 - `libclang.dll` for the WinFsp Rust bindings. Set `LIBCLANG_PATH`, or install it locally with `python -m pip install --target .tools libclang`.
 - [WinFsp 2.1](https://winfsp.dev/rel/) for live mounts; Inno Setup 6 for the installer.
@@ -141,6 +141,36 @@ It uses only the disk-backed demo remote and exercises create/read/write, stream
 
 Version 0.3.0 has passed 48 Rust tests, two Flutter widget tests, static analysis, Clippy, actual WinFsp mounted-drive tests, and limited live Google streamed read/write verification. These are recorded results from the development machine, not a substitute for running tests on your own Windows setup. See [VALIDATION.md](VALIDATION.md) for the evidence and remaining manual validation.
 
+## macOS build and run
+
+The macOS adapter targets macOS 12+ on Apple Silicon or Intel, built natively for the current machine. Install Xcode and its command-line tools, Rust 1.88+, Flutter with Dart 3.12.2+, [macFUSE 5.4+](https://macfuse.github.io/), and `pkg-config` (for example, `brew install pkgconf`). Follow macFUSE's installation instructions and approve its filesystem extension when required. The macFUSE driver is installed separately; the app does not install it or change system security settings.
+
+From the repository root:
+
+```bash
+./scripts/build-macos.sh
+open release/StorageBridge.app
+```
+
+This runs Rust and Flutter checks, builds the engine and app, places the engine in `Contents/MacOS`, and creates `release/StorageBridge-macos-arm64.zip` or `StorageBridge-macos-x86_64.zip`. The app has a local ad-hoc signature; public distribution still needs Developer ID signing and notarization. Move the app to its permanent location before enabling startup reconnect.
+
+Use **Start engine**, **Import OAuth client**, and **Sign in with Google**, then **Mount drive**. The mount is fixed at `~/StorageBridge`; it must be an empty real directory and cannot already be mounted. It uses macFUSE's `local` option to appear as **Storage Bridge** in Finder; use macFUSE 5.5+ for its Finder integration fixes and enable **External disks** in Finder Settings if hidden. **Open Finder** opens that folder. Close the window to hide it, then reopen it from the menu bar or Dock. Quitting the UI leaves the engine running; use Settings to stop the engine after uploads complete. Startup reconnect writes `~/Library/LaunchAgents/dev.storagebridge.engine.plist` for the next login.
+
+Credentials and upload-session secrets are stored in the macOS login Keychain. Existing `.dpapi` filenames are retained as nonsecret Keychain marker files. Metadata and pending writes live under `~/Library/Application Support/dev.StorageBridge.StorageBridge/google` (or `demo`), protected by a user-only directory. Preserve this directory while uploads remain. The framed JSON protocol is unchanged, transported over a user-only `/tmp/storagebridge-<uid>/v1.sock` socket. `filesystem_available` and `platform` are included in status; `winfsp_installed` remains a compatibility alias for driver availability. macOS ignores the mount request's Windows `letter` parameter.
+
+Diagnostics and an isolated mounted filesystem smoke test:
+
+```bash
+target/debug/storage-bridge --diagnose
+target/debug/storage-bridge --request '{"version":1,"method":"status"}'
+./scripts/smoke-mount-macos.sh
+# Or pass release/StorageBridge.app/Contents/MacOS/storage-bridge
+```
+
+The smoke test uses a separate local demo instance and no Google credentials. It exercises a 17 MiB streamed read, partial writes, flush, file replacement, rename, delete, and unmount. It shares the fixed mount folder, so unmount any normal instance first. Native extended attributes, symlinks, arbitrary POSIX permissions, Finder cloud badges, and File Provider integration are not implemented. macOS retains the shared engine's Windows-safe filename aliases.
+
+Rust tests and Flutter checks can run without activating the macFUSE extension, but linking the engine requires its libraries. Live mounting, Finder save behavior, Keychain consent, Google authentication, and login reconnect need manual verification before using important files. See [VALIDATION.md](VALIDATION.md).
+
 ## Storage semantics
 
 - Browsing uses metadata only. Uncached reads stream requested ranges into RAM. Pending edits and retained complete local writes can be read offline; other reads require internet unless their ranges happen to remain in RAM. New files/folders require a connection to reserve a Drive ID.
@@ -181,10 +211,10 @@ The cache budget is not a hard ceiling for unsent work. Dirty or open files are 
 
 ## Source layout and IPC
 
-- `desktop/`: Flutter UI and thin C++ Windows named-pipe/tray bridge.
+- `desktop/`: Flutter UI, C++ Windows named-pipe/tray bridge, and Swift macOS menu bar bridge.
 - `desktop/packages/liquid_ui_components/`: vendored UI package, shaders, and license.
 - `engine/src/`: Rust engine, Google REST client, OAuth, SQLite store, and cache.
-- `engine/src/platform/`: Windows filesystem, DPAPI, startup registration, and IPC.
+- `engine/src/platform/`: Windows filesystem, DPAPI, startup registration, and IPC; macOS counterparts under `macos/`.
 - `engine/tests/`: offline, scope, recovery, streaming, and cache behavior tests.
 - `scripts/`: build, IPC diagnostics, and mounted-filesystem smoke test.
 - `installer/`: Inno Setup Windows installer source.
@@ -207,10 +237,10 @@ Invoke-Bridge retry
 
 State is under `%LOCALAPPDATA%\StorageBridge\StorageBridge\data\google` (or `demo`), as resolved by the Rust `directories` crate. Keep the database and cache together. Uninstall preserves this state and pending files; never delete it while uploads remain.
 
-The Rust `Remote` trait separates provider behavior from filesystem operations. A future macOS adapter can reuse OAuth/Drive/cache/queue logic; credential storage, IPC, startup, and mounting still need macOS implementations and testing on a Mac.
+The Rust `Remote` trait separates provider behavior from filesystem operations. Windows and macOS adapters reuse the same OAuth, Drive, cache, streaming, and durable queue implementation.
 
 ## License
 
 GPL-3.0-only, including the obligations of the GPL WinFsp Rust bindings. See `LICENSE` and `THIRD_PARTY_NOTICES.md`. This project has not been prepared for commercial distribution.
 
-Storage Bridge is independent software and is not affiliated with Google, Microsoft, or Apple. Existing Google Docs/Sheets/Slides, shortcuts, shared drives, pinned offline folders, native cloud-status overlays, account switching, and macOS mounting remain outside the current MVP.
+Storage Bridge is independent software and is not affiliated with Google, Microsoft, or Apple. Existing Google Docs/Sheets/Slides, shortcuts, shared drives, pinned offline folders, native cloud-status overlays, and account switching remain outside the current MVP. macOS mounting is implemented but awaits live filesystem validation.
