@@ -12,6 +12,9 @@ pub struct Node {
     pub directory: bool,
     pub size: u64,
     pub version: String,
+    /// Blob revision, unaffected by Drive metadata-only changes such as video processing.
+    #[serde(default)]
+    pub head_revision: Option<String>,
     pub cached: bool,
     pub dirty: bool,
     pub deleted: bool,
@@ -19,6 +22,22 @@ pub struct Node {
     pub modified: i64,
 }
 
+impl Node {
+    pub fn content_version(&self) -> String {
+        match self.head_revision.as_deref().filter(|r| !r.is_empty()) {
+            Some(revision) => format!("blob:{revision}"),
+            None => format!("metadata:{}", self.version),
+        }
+    }
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.size == other.size
+            && match (&self.head_revision, &other.head_revision) {
+                (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a == b,
+                _ => self.version == other.version,
+            }
+    }
+}
 pub struct Store {
     pub db: Connection,
 }
@@ -30,7 +49,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, kind TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, next_try INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL, message TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL, message TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY, data TEXT NOT NULL);")?;
         Ok(Self { db })
     }
     pub fn all(&self) -> Result<Vec<Node>> {

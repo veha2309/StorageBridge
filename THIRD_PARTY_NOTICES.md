@@ -13,3 +13,5 @@ Other direct Rust dependencies include anyhow (MIT/Apache-2.0), base64 (MIT/Apac
 Microsoft Visual C++ redistributable runtime components, when bundled from Visual Studio, remain subject to Microsoft's runtime redistribution license. They are not relicensed under this project's GPL license.
 
 Google Drive is a trademark of Google LLC. Storage Bridge is an independent application and is not affiliated with Google, Microsoft, or Apple.
+
+The macOS adapter uses fuser (MIT; https://github.com/cberner/fuser), libc (MIT/Apache-2.0), and security-framework (MIT/Apache-2.0; https://github.com/kornelski/rust-security-framework). macFUSE is installed separately from https://macfuse.github.io/ and remains subject to its own license and distribution terms. It is not bundled with Storage Bridge.

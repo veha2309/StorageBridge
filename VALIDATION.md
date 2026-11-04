@@ -1,5 +1,43 @@
 # Windows preview validation
 
+## Large video readback correction — 2026-11-04
+
+- The running Google engine recorded `Remote file changed; close and reopen it` while a 3,410,694,231-byte video was being copied back. It was still running, with zero managed content bytes; the 4 GiB allowance was not the read-side failure. Another source-backed upload was allowed to finish before the idle engine was replaced and the same drive letter remounted.
+- Fixed a reproducible false read failure: Google's general file `version` includes metadata-only changes, while `headRevisionId` identifies blob content. Reads now validate blob revision and size after receiving ranges; actual content changes are still refused. Legacy metadata without a blob revision keeps conservative version/ETag checks. Added backward-compatible optional node metadata.
+- Added up to two retries for transient HTTP/network failures and interrupted bodies. Sequential reads use adaptive windows up to 8 MiB with a 32 MiB retained RAM cache, and fall back to 1 MiB pieces on broken/slow wide responses. No complete read copy is written to the content directory.
+- All 75 Windows Rust tests and strict Clippy passed. New fixtures cover metadata-only version/ETag changes, real content changes, HTTP 429/503, retry exhaustion, disconnected bodies, wide-range fallback, and content-key cache invalidation. A complete 3,410,694,231-byte synthetic stream verifies every block across the 2 GiB boundary and EOF without managed disk growth.
+- The isolated real WinFsp smoke passed against the corrected engine: normal reads/writes, replacement saves, disk-full rejection/recovery, direct move above the allowance, SQLite query IPC and unmount.
+- Live mounted samples of the affected Google video at byte 0, 2,147,483,648 and 3,409,645,655 matched independently fetched Google ranges. **The full 3,410,694,231-byte mounted stream then matched Google's SHA-256**, completing in 679.3 seconds. This read used the real WinFsp mount and Google account, not the local remote or a synthetic fixture. The verifier created no local media copy. During the run, the engine reported zero managed content bytes, retained RAM at or below 32 MiB, and no read error. At completion the mount remained connected with zero pending work and zero open handles.
+
+The diagnostic `engine/examples/verify_mounted_read.rs` reads existing configured Google credentials without logging them, checks the chosen file is directly inside the mounted test scope, and verifies mounted bytes without modifying cloud content or creating a local media copy. It is a developer-invoked live test, not a credential-bearing CI job.
+
+## Direct transfers and SQLite reader 0.4.0 — 2026-11-04
+
+- 67 Rust tests passed on Windows, including 12 new tests covering source-backed uploads larger than the allowance, missing/incorrect checksums, lost upload acknowledgements and restart recovery, changed/replaced sources, source-handle sharing protection, recovery after verified deletion, engine-data protection, SQLite journal rejection, read-only SQL restrictions, cloud sidecars/revision changes, and result caps.
+- Five Flutter widget tests passed, including native file selection → direct move IPC and cloud SQLite query → result display. Strict Flutter analysis, Clippy and formatting checks passed.
+- The actual WinFsp demo smoke test passed with a **65 MiB original and a 64 MiB allowance**: zero managed staging growth during direct upload, verified source removal, checksum readback through the mounted drive, and zero content-disk growth on reads. A real closed SQLite image was directly uploaded/moved, queried through asynchronous named-pipe IPC, and returned its indexed result without a local database copy.
+- The 3 GiB SQLite test uses a real SQLite image with virtual trailing zeroes; its indexed lookup fetched at most 2 MiB. This proves range behavior in the fixture, not real Google performance or a measured 3 GiB transfer. The direct upload integration fixture is 8 MiB against a 1 MiB allowance. Resumable network offsets remain covered by the existing HTTP fixture tests.
+- Tests and mounts use isolated local remotes and disposable sources. No new live Google acceptance run or live macFUSE test was performed for these features. Mac direct uploads retain the original; automatic removal requires the Windows native lease.
+- CI runs the shared tests on Windows and both Mac architectures for each push/PR; the extended Windows mount smoke runs the direct-transfer and SQLite IPC acceptance paths as well. Live Google checksum availability, interrupted multi-gigabyte transfers, and actual Mac operation still require acceptance with disposable user data.
+
+## CI configuration — 2026-11-04
+
+- Added push/PR/merge-group workflows for Windows x64, macOS Apple Silicon, and macOS Intel, with a stable aggregate gate and a separate manual native Mac acceptance workflow.
+- actionlint 1.7.12 validated both workflow definitions locally. Python version-consistency checks, PowerShell parser checks, and Bash syntax checks passed.
+- Verified the pinned WinFsp installer's SHA-256 and valid Authenticode signature before configuring its CI prerequisite helper.
+- Installer smoke checks now derive the app version from the installer source and require a clean account. The existing personal installation was not uninstalled to exercise that CI-only path.
+- The baseline at `082e37c` passed all hosted Windows/Mac jobs: [push run 41791210916](https://github.com/veha2309/StorageBridge/actions/runs/41791210916). This predates the direct-transfer/SQLite additions above; their new run must pass separately. Native Mac mounting remains a dedicated-runner acceptance test.
+
+## Enforced local content allowance 0.4.0 — 2026-11-04
+
+- 55 Rust tests passed (48 existing + 7 content-allowance tests). Coverage includes boundary rejection without content/intent changes, growth overflow, in-place overwrites, partial-journal restart/upload recovery, concurrent files, clean-copy eviction with open/dirty protection, refused limit reduction, inherited over-limit pending data, streamed reads independent of cloud size, and bounded conflict-copy duplication.
+- Three Flutter widget tests passed. They cover legacy engine compatibility, editable content allowance in online-only mode, settings IPC, per-file explanations, safe cleanup invocation, and aggregate clipboard reports excluding filenames. Flutter analysis and strict Clippy passed during implementation.
+- Actual WinFsp demo test passed: 17 MiB checksum, streamed reads without disk copies, partial edits, file replacement/rename/delete, a 64 MiB content boundary, native disk-full rejection, preservation of accepted data, protected cleanup while open, upload/cleanup recovery, and unmount.
+- The new allowance has been tested with the isolated local remote, not a new live Google acceptance run. The previously recorded 0.3.0 Google tests remain historical evidence.
+- The 0.4.0 core and UI support the new quota on both adapters in source. macOS runtime and compilation are not established by these Windows results; its gated tests execute zero cases on Windows. Mac build-script Rust tests and Clippy were re-enabled. See PLATFORMS.md.
+
+The allowance counts managed content-file lengths, not physical allocation or all process memory. Existing over-limit pending work is preserved; new growth is refused. Multi-request operations can retain an accepted partial destination after a later write is rejected. Large new files require sufficient staging allowance.
+
 ## Repository publication checks
 
 Before the initial source publication on 2026-10-29:
@@ -58,3 +96,27 @@ Tests cover durable queued edits, offline restart/retry, interrupted download cl
 The mounted-drive test uses the isolated local remote, not a Google account. It performs real Windows filesystem operations for create, read, write, replacement, rename, enumeration, deletion, and unmount. It does not claim validation in Office or other specific editors.
 
 Still requiring user configuration/manual validation: live Google browser consent, token refresh against Google, uploads/downloads in My Drive/StorageBridge, real Google quota/revocation behavior, startup reconnect with authenticated credentials, power-loss/disk-exhaustion testing on a disposable volume, cross-device synchronization, and macOS integration. Version checks preserve detected conflicts but do not provide a distributed lock for concurrent editors.
+
+
+## macOS adapter validation (2026-10-29)
+
+Added macFUSE mounting, Keychain-backed credentials, user-only Unix IPC and instance locking, LaunchAgent startup reconnect, a Swift Flutter runner with menu bar controls, Finder-specific UI, native-architecture packaging, and an isolated mounted-drive smoke script.
+
+Checked on Apple Silicon with Rust 1.99.1, Flutter 3.44.6 / Dart 3.12.2, and Xcode:
+
+- `cargo check --all-targets`: passed.
+- All 53 Rust tests passed, including the macOS adapter and daemon integration tests. HTTP fixtures used local loopback servers, without Google credentials.
+- macOS daemon integration exercised private Unix socket requests, duplicate-instance rejection, protocol-version rejection, settings persistence, shutdown, and restart. It used a temporary home directory and a separate demo instance.
+- Rust Clippy with warnings denied: passed.
+- Flutter analysis and both widget tests: passed.
+- Flutter macOS debug and native arm64 release builds: passed.
+- Shell syntax checks for both new macOS scripts: passed.
+- Packaged `release/StorageBridge.app` and `release/StorageBridge-macos-arm64.zip`; ad-hoc code-signature verification passed. Mounting requires a separate macFUSE installation; the engine can start without it.
+
+The macFUSE 5.4.0 package was extracted under `/tmp` solely for build/link libraries. Neither its filesystem extension nor its system installation was activated. Mount setup uses the public libfuse3 session API and a duplicated device descriptor, rather than the libfuse2 mount entry point disabled in macFUSE 5.3+ (https://github.com/cberner/fuser/issues/752). Kernel initialization is required before a mount reports success. The Rust test runs used the extracted library and framework via `DYLD_LIBRARY_PATH` / `DYLD_FRAMEWORK_PATH`, and pkgconf was built under `/tmp`. Those test environment paths are not part of the application or build scripts.
+
+Still unverified: a live macFUSE mount (including `scripts/smoke-mount-macos.sh`), Finder/application save patterns, real Keychain access and consent, Google OAuth, startup reconnect after login, Intel hardware, Developer ID signing/notarization, and Windows regression testing. The Windows-specific `dpapi_roundtrip` test is a no-op on macOS; it does not validate Keychain. Do not treat compile checks or shared-engine tests as evidence of those native workflows.
+
+Follow-up startup fix: reproduced and removed a hard dyld dependency on `libfuse.2.dylib` by weak-linking the unused fuser mount library. The packaged engine now passes `--diagnose` without macFUSE installed. The daemon integration test removes temporary DYLD overrides and passes startup, IPC, shutdown, and restart checks. Flutter analysis, both widget tests, release rebuild, and package signature verification also passed. Corrected remaining Windows drive/startup labels on macOS.
+
+Browser-launch follow-up: macOS now invokes `/usr/bin/open` from the headless daemon rather than AppKit browser APIs on its background login thread. The launcher has a ten-second timeout and returns actionable failure messages. Tests cover successful launcher exit, unsuccessful exit, and terminating a stalled launcher; all five platform tests and Clippy passed. The arm64 engine/package was rebuilt and signed. Real Google browser authorization remains unverified.

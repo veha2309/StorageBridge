@@ -15,11 +15,11 @@ fn main() {
         std::process::exit(1);
     }
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run() -> Result<()> {
-    anyhow::bail!("The daemon currently supports Windows only; shared engine code is portable")
+    anyhow::bail!("The daemon supports Windows and macOS; shared engine code is portable")
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn run() -> Result<()> {
     use storage_bridge::platform::{self, filesystem, ipc};
     let args: Vec<_> = std::env::args().collect();
@@ -50,7 +50,7 @@ fn run() -> Result<()> {
     if args.iter().any(|a| a == "--diagnose") {
         println!(
             "{}",
-            json!({"platform":"windows","winfsp_installed":filesystem::available(),"pipe":ipc::pipe_name()?})
+            json!({"platform":std::env::consts::OS,"winfsp_installed":filesystem::available(),"pipe":ipc::pipe_name()?})
         );
         return Ok(());
     }
@@ -68,6 +68,11 @@ fn run() -> Result<()> {
             "google".into()
         });
     std::fs::create_dir_all(&root)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
     let auth = Arc::new(Auth::new(root.clone())?);
     let google = GoogleDrive::new(auth.clone())?;
     let progress = google.progress.clone();
@@ -127,6 +132,18 @@ fn run() -> Result<()> {
             std::thread::sleep(Duration::from_secs(30));
         }
     });
+    let direct = runtime.clone();
+    let account = auth.clone();
+    std::thread::spawn(move || {
+        loop {
+            if (demo || account.connected())
+                && let Err(error) = direct.tick_imports()
+            {
+                direct.engine.lock().last_error = Some(error.to_string());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
     let mut host = None;
     if engine.lock().store.setting("startup").as_deref() == Some("true")
         && (demo || auth.connected())
@@ -142,6 +159,10 @@ fn run() -> Result<()> {
         }
     }
     ipc::serve(move |request| {
+        #[cfg(target_os = "macos")]
+        if host.as_ref().is_some_and(|h| !h.is_mounted()) {
+            host = None;
+        }
         let mut action = || -> Result<Value> {
             ensure!(request["version"] == 1, "Unsupported IPC protocol version");
             let method = request["method"].as_str().context("Missing method")?;
@@ -158,6 +179,7 @@ fn run() -> Result<()> {
                         status
                     };
                     s["transfer"] = json!(*progress.lock());
+                    s["sqlite_query"] = runtime.query_state.lock().clone();
                     s["scope_folder"] = json!(if demo {
                         "Local test drive"
                     } else {
@@ -168,6 +190,12 @@ fn run() -> Result<()> {
                     s["login_state"] = json!(*auth.login_state.lock());
                     s["mounted"] = json!(host.is_some());
                     s["winfsp_installed"] = json!(filesystem::available());
+                    s["filesystem_available"] = json!(filesystem::available());
+                    s["platform"] = json!(std::env::consts::OS);
+                    #[cfg(target_os = "macos")]
+                    {
+                        s["drive_letter"] = json!(filesystem::mount_path());
+                    }
                     s["demo"] = json!(demo);
                     Ok(s)
                 }
@@ -198,7 +226,10 @@ fn run() -> Result<()> {
                 "mount" => {
                     ensure!(host.is_none(), "Drive is already mounted");
                     ensure!(demo || auth.connected(), "Sign in first");
+                    #[cfg(windows)]
                     let letter = p["letter"].as_str().unwrap_or("G:").to_uppercase();
+                    #[cfg(target_os = "macos")]
+                    let letter = filesystem::mount_path();
                     if engine.lock().store.setting("root_id").is_none() {
                         runtime.initialize()?;
                     }
@@ -211,13 +242,30 @@ fn run() -> Result<()> {
                         engine.lock().open.is_empty(),
                         "Files are still open; close them before unmounting"
                     );
-                    if let Some(mut h) = host.take() {
-                        h.stop();
-                        h.unmount();
+                    if let Some(h) = host.as_mut() {
+                        #[cfg(windows)]
+                        {
+                            h.stop();
+                            h.unmount();
+                        }
+                        #[cfg(target_os = "macos")]
+                        h.unmount()?;
                     }
+                    host = None;
                     Ok(json!({}))
                 }
                 "settings" => {
+                    if let Some(value) = p.get("content_limit") {
+                        let limit = value
+                            .as_u64()
+                            .context("Local content limit must be an integer number of bytes")?;
+                        ensure!(
+                            (64 * 1024 * 1024..=storage_bridge::storage::MAX_CONTENT_LIMIT)
+                                .contains(&limit),
+                            "Local content limit must be between 64 MiB and 16 TiB"
+                        );
+                        engine.lock().set_content_limit(limit)?;
+                    }
                     if let Some(value) = p.get("online_only") {
                         engine.lock().set_online_only(
                             value
@@ -249,6 +297,40 @@ fn run() -> Result<()> {
                     }
                     Ok(json!({}))
                 }
+                "import_file" => {
+                    ensure!(demo || auth.connected(), "Sign in first");
+                    runtime.initialize()?;
+                    let path = p["source_path"]
+                        .as_str()
+                        .context("Choose a local source file")?;
+                    ensure!(path.len() <= 32768, "Source path is too long");
+                    let folder = p["folder"].as_str().unwrap_or("");
+                    ensure!(folder.len() <= 4096, "Destination path is too long");
+                    let move_source = p["move_source"].as_bool().unwrap_or(false);
+                    let id =
+                        runtime.queue_import(std::path::Path::new(path), folder, move_source)?;
+                    Ok(json!({"id":id}))
+                }
+                "dismiss_import" => {
+                    runtime.dismiss_import(p["id"].as_str().context("Missing transfer ID")?)?;
+                    Ok(json!({}))
+                }
+                "sqlite_query" => {
+                    ensure!(demo || auth.connected(), "Sign in first");
+                    runtime.initialize()?;
+                    runtime.start_sqlite_query(
+                        p["path"]
+                            .as_str()
+                            .context("Enter a cloud database path")?
+                            .into(),
+                        p["sql"].as_str().context("Enter a read-only query")?.into(),
+                    )?;
+                    Ok(json!({}))
+                }
+                "release_cache" => {
+                    engine.lock().release_clean_content()?;
+                    Ok(json!({}))
+                }
                 "retry" => {
                     engine.lock().retry()?;
                     Ok(json!({}))
@@ -265,10 +347,16 @@ fn run() -> Result<()> {
                         "Pending uploads remain; retry or wait before stopping"
                     );
                     drop(e);
-                    if let Some(mut h) = host.take() {
-                        h.stop();
-                        h.unmount();
+                    if let Some(h) = host.as_mut() {
+                        #[cfg(windows)]
+                        {
+                            h.stop();
+                            h.unmount();
+                        }
+                        #[cfg(target_os = "macos")]
+                        h.unmount()?;
                     }
+                    host = None;
                     std::thread::spawn(|| {
                         std::thread::sleep(Duration::from_millis(500));
                         std::process::exit(0);

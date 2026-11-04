@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
-
+import 'dart:io' show Platform;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:liquid_ui_components/liquid_ui_components.dart';
 
+final usesMacOS = Platform.isMacOS;
 const native = MethodChannel('dev.storagebridge/desktop');
 void main() => runApp(const StorageBridgeApp());
 
@@ -75,11 +77,23 @@ class _DashboardState extends State<Dashboard> {
   bool busy = false, refreshing = false;
   Timer? timer;
   final cache = TextEditingController(text: '10');
+  final contentLimit = TextEditingController(text: '1');
+  final importFolder = TextEditingController();
+  final databasePath = TextEditingController();
+  final sql = TextEditingController(
+    text: 'SELECT name, type FROM sqlite_schema LIMIT 100',
+  );
+  String? sourcePath;
+  bool moveSource = false;
+  String _version = '';
 
   @override
   void initState() {
     super.initState();
     refresh();
+    PackageInfo.fromPlatform().then((info) {
+      if (mounted) setState(() => _version = info.version);
+    });
     timer = Timer.periodic(const Duration(seconds: 2), (_) => refresh());
   }
 
@@ -87,6 +101,10 @@ class _DashboardState extends State<Dashboard> {
   void dispose() {
     timer?.cancel();
     cache.dispose();
+    contentLimit.dispose();
+    importFolder.dispose();
+    databasePath.dispose();
+    sql.dispose();
     super.dispose();
   }
 
@@ -119,7 +137,8 @@ class _DashboardState extends State<Dashboard> {
       if (mounted && status != null) {
         setState(() {
           status = null;
-          error = 'Background engine disconnected. Start it again to reconnect; pending files remain on this PC.';
+          error =
+              'Background engine disconnected. Start it again to reconnect; pending files remain on this PC.';
         });
       }
     } finally {
@@ -129,6 +148,10 @@ class _DashboardState extends State<Dashboard> {
 
   void acceptStatus(Map<String, dynamic> next) {
     setState(() {
+      if (status?['storage'] == null && next['storage'] is Map) {
+        contentLimit.text =
+            ((next['storage']['limit_bytes'] as num) / 1073741824).toString();
+      }
       if (status == null) {
         letter = next['drive_letter'] as String? ?? 'G:';
         cache.text =
@@ -164,7 +187,8 @@ class _DashboardState extends State<Dashboard> {
 
   Future<void> start(bool demo) => act(() async {
     await native.invokeMethod<void>('launch', demo);
-    for (var i = 0; i < 25; i++) {
+    String? startupError;
+    for (var i = 0; i < (usesMacOS ? 150 : 25); i++) {
       await Future<void>.delayed(const Duration(milliseconds: 200));
       try {
         final next = await request('status');
@@ -172,10 +196,14 @@ class _DashboardState extends State<Dashboard> {
           acceptStatus(next);
         }
         return;
-      } catch (_) {}
+      } catch (e) {
+        startupError = e is PlatformException ? e.message : e.toString();
+      }
     }
     throw Exception(
-      'Engine did not start. Check that storage-bridge.exe is beside the desktop app.',
+      usesMacOS
+          ? 'Engine is not responding. ${startupError ?? 'Try starting it again.'}'
+          : 'Engine did not start. Check that storage-bridge.exe is beside the desktop app.',
     );
   });
   Future<void> importClient() => act(() async {
@@ -249,10 +277,12 @@ class _DashboardState extends State<Dashboard> {
                         ),
                       ),
                       const Spacer(),
-                      const Padding(
-                        padding: EdgeInsets.all(24),
+                      Padding(
+                        padding: const EdgeInsets.all(24),
                         child: Text(
-                          'Windows preview · v0.3.0\nCustom Rust storage engine',
+                          '${usesMacOS ? 'macOS' : 'Windows'} preview'
+                          '${_version.isEmpty ? '' : ' · v$_version'}'
+                          '\nCustom Rust storage engine',
                           style: TextStyle(
                             color: Color(0xff9baab4),
                             height: 1.8,
@@ -283,6 +313,7 @@ class _DashboardState extends State<Dashboard> {
                                   'Transfer queue',
                                   'Recent activity',
                                   'Bridge settings',
+                                  'Cloud SQLite reader',
                                 ][page],
                                 style: const TextStyle(
                                   fontSize: 28,
@@ -342,6 +373,10 @@ class _DashboardState extends State<Dashboard> {
                           label: 'Settings',
                           icon: Icons.tune,
                         ),
+                        LiquidGlassNavigationItem(
+                          label: 'SQLite',
+                          icon: Icons.table_chart_outlined,
+                        ),
                       ],
                     ),
                     const SizedBox(height: 24),
@@ -357,7 +392,7 @@ class _DashboardState extends State<Dashboard> {
                           ),
                           statusTile(
                             Icons.folder_outlined,
-                            'WINDOWS DRIVE',
+                            usesMacOS ? 'FINDER DRIVE' : 'WINDOWS DRIVE',
                             mountedDrive
                                 ? (s['drive_letter']?.toString() ?? letter)
                                 : 'Not mounted',
@@ -402,124 +437,128 @@ class _DashboardState extends State<Dashboard> {
                         ),
                       ])
                     else if (page == 0) ...[
-                      panel(
-                        s['demo'] == true
-                            ? 'Local filesystem test'
-                            : 'Google Drive',
-                        [
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.all(18),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xffd5ebe5),
-                                  borderRadius: BorderRadius.circular(16),
+                      if (s['storage'] is Map)
+                        storagePanel(s)
+                      else
+                        panel(
+                          s['demo'] == true
+                              ? 'Local filesystem test'
+                              : 'Google Drive',
+                          [
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(18),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xffd5ebe5),
+                                    borderRadius: BorderRadius.circular(16),
+                                  ),
+                                  child: const Icon(
+                                    Icons.cloud_outlined,
+                                    size: 42,
+                                    color: Color(0xff347a74),
+                                  ),
                                 ),
-                                child: const Icon(
-                                  Icons.cloud_outlined,
-                                  size: 42,
-                                  color: Color(0xff347a74),
-                                ),
-                              ),
-                              const SizedBox(width: 22),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      s['about']?['user']?['displayName']
-                                              ?.toString() ??
-                                          'Connect your Google account',
-                                      style: const TextStyle(
-                                        fontSize: 21,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Text(
-                                      s['about']?['user']?['emailAddress']
-                                              ?.toString() ??
-                                          'Read files directly from Drive. Edits upload in the background.',
-                                    ),
-                                    const SizedBox(height: 18),
-                                    if (!connected)
-                                      Wrap(
-                                        spacing: 12,
-                                        runSpacing: 10,
-                                        children: [
-                                          glassAction(
-                                            onPressed: busy
-                                                ? null
-                                                : importClient,
-                                            icon: const Icon(
-                                              Icons.file_open_outlined,
-                                            ),
-                                            label: Text(
-                                              s['configured'] == true
-                                                  ? 'Replace OAuth client'
-                                                  : 'Import OAuth client',
-                                            ),
-                                          ),
-                                          LiquidGlassButton(
-                                            onPressed:
-                                                busy ||
-                                                    s['configured'] != true ||
-                                                    s['login_state'] ==
-                                                        'waiting_for_browser'
-                                                ? null
-                                                : () => act(() async {
-                                                    await request('login');
-                                                  }),
-                                            child: Text(
-                                              s['login_state'] ==
-                                                      'waiting_for_browser'
-                                                  ? 'Waiting for browser…'
-                                                  : 'Sign in with Google',
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    if (connected)
+                                const SizedBox(width: 22),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
                                       Text(
-                                        '${s['pending'] ?? 0} pending uploads',
-                                      ),
-                                    if (connected && s['demo'] != true)
-                                      TextButton(
-                                        onPressed:
-                                            busy ||
-                                                s['login_state'] ==
-                                                    'waiting_for_browser'
-                                            ? null
-                                            : () => act(() async {
-                                                await request('login');
-                                              }),
-                                        child: const Text(
-                                          'Reconnect Google account',
+                                        s['about']?['user']?['displayName']
+                                                ?.toString() ??
+                                            'Connect your Google account',
+                                        style: const TextStyle(
+                                          fontSize: 21,
+                                          fontWeight: FontWeight.w600,
                                         ),
                                       ),
-                                  ],
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        s['about']?['user']?['emailAddress']
+                                                ?.toString() ??
+                                            'Read files directly from Drive. Edits upload in the background.',
+                                      ),
+                                      const SizedBox(height: 18),
+                                      if (!connected)
+                                        Wrap(
+                                          spacing: 12,
+                                          runSpacing: 10,
+                                          children: [
+                                            glassAction(
+                                              onPressed: busy
+                                                  ? null
+                                                  : importClient,
+                                              icon: const Icon(
+                                                Icons.file_open_outlined,
+                                              ),
+                                              label: Text(
+                                                s['configured'] == true
+                                                    ? 'Replace OAuth client'
+                                                    : 'Import OAuth client',
+                                              ),
+                                            ),
+                                            LiquidGlassButton(
+                                              onPressed:
+                                                  busy ||
+                                                      s['configured'] != true ||
+                                                      s['login_state'] ==
+                                                          'waiting_for_browser'
+                                                  ? null
+                                                  : () => act(() async {
+                                                      await request('login');
+                                                    }),
+                                              child: Text(
+                                                s['login_state'] ==
+                                                        'waiting_for_browser'
+                                                    ? 'Waiting for browser…'
+                                                    : 'Sign in with Google',
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      if (connected)
+                                        Text(
+                                          '${s['pending'] ?? 0} pending uploads',
+                                        ),
+                                      if (connected && s['demo'] != true)
+                                        TextButton(
+                                          onPressed:
+                                              busy ||
+                                                  s['login_state'] ==
+                                                      'waiting_for_browser'
+                                              ? null
+                                              : () => act(() async {
+                                                  await request('login');
+                                                }),
+                                          child: const Text(
+                                            'Reconnect Google account',
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (s['login_state'] != null &&
+                                ![
+                                  'idle',
+                                  'connected',
+                                  'waiting_for_browser',
+                                ].contains(s['login_state']))
+                              Padding(
+                                padding: const EdgeInsets.only(top: 16),
+                                child: Text(
+                                  s['login_state'].toString(),
+                                  style: const TextStyle(color: Colors.red),
                                 ),
                               ),
-                            ],
-                          ),
-                          if (s['login_state'] != null &&
-                              ![
-                                'idle',
-                                'connected',
-                                'waiting_for_browser',
-                              ].contains(s['login_state']))
-                            Padding(
-                              padding: const EdgeInsets.only(top: 16),
-                              child: Text(
-                                s['login_state'].toString(),
-                                style: const TextStyle(color: Colors.red),
-                              ),
-                            ),
-                        ],
-                      ),
+                          ],
+                        ),
                       const SizedBox(height: 20),
-                      panel('Your Windows drive', [
+                      panel(usesMacOS ? 'Your Finder drive' : 'Your Windows drive', [
                         Text(
                           s['demo'] == true
                               ? 'Isolated local test drive — no Google connection.'
@@ -527,8 +566,8 @@ class _DashboardState extends State<Dashboard> {
                           style: const TextStyle(fontWeight: FontWeight.w600),
                         ),
                         const SizedBox(height: 10),
-                        const Text(
-                          'Browse files in File Explorer. Keep the engine running until uploads finish.',
+                        Text(
+                          'Browse files in ${usesMacOS ? 'Finder' : 'File Explorer'}. Keep the engine running until uploads finish.',
                         ),
                         const SizedBox(height: 20),
                         Wrap(
@@ -536,25 +575,28 @@ class _DashboardState extends State<Dashboard> {
                           runSpacing: 12,
                           crossAxisAlignment: WrapCrossAlignment.center,
                           children: [
-                            SizedBox(
-                              width: 130,
-                              child: DropdownButtonFormField<String>(
-                                initialValue: letter,
-                                decoration: const InputDecoration(
-                                  labelText: 'Drive letter',
+                            if (!usesMacOS)
+                              SizedBox(
+                                width: 130,
+                                child: DropdownButtonFormField<String>(
+                                  initialValue: letter,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Drive letter',
+                                  ),
+                                  items: [
+                                    for (var c = 68; c <= 90; c++)
+                                      DropdownMenuItem(
+                                        value: '${String.fromCharCode(c)}:',
+                                        child: Text(
+                                          '${String.fromCharCode(c)}:',
+                                        ),
+                                      ),
+                                  ],
+                                  onChanged: mountedDrive
+                                      ? null
+                                      : (v) => setState(() => letter = v!),
                                 ),
-                                items: [
-                                  for (var c = 68; c <= 90; c++)
-                                    DropdownMenuItem(
-                                      value: '${String.fromCharCode(c)}:',
-                                      child: Text('${String.fromCharCode(c)}:'),
-                                    ),
-                                ],
-                                onChanged: mountedDrive
-                                    ? null
-                                    : (v) => setState(() => letter = v!),
                               ),
-                            ),
                             glassAction(
                               onPressed: busy || !connected
                                   ? null
@@ -577,24 +619,34 @@ class _DashboardState extends State<Dashboard> {
                                   'openDrive',
                                   s['drive_letter'],
                                 ),
-                                child: const Text('Open File Explorer'),
+                                child: Text(
+                                  usesMacOS
+                                      ? 'Open Finder'
+                                      : 'Open File Explorer',
+                                ),
                               ),
                           ],
                         ),
-                        if (s['winfsp_installed'] != true)
+                        if ((s['filesystem_available'] ??
+                                s['winfsp_installed']) !=
+                            true)
                           Padding(
                             padding: const EdgeInsets.only(top: 16),
                             child: Wrap(
                               crossAxisAlignment: WrapCrossAlignment.center,
                               spacing: 12,
                               children: [
-                                const Text(
-                                  'WinFsp is required to mount a Windows drive.',
+                                Text(
+                                  usesMacOS
+                                      ? 'macFUSE is required to mount a Finder drive.'
+                                      : 'WinFsp is required to mount a Windows drive.',
                                 ),
                                 TextButton(
                                   onPressed: () =>
                                       native.invokeMethod<void>('openWinfsp'),
-                                  child: const Text('Get WinFsp'),
+                                  child: Text(
+                                    usesMacOS ? 'Get macFUSE' : 'Get WinFsp',
+                                  ),
                                 ),
                               ],
                             ),
@@ -631,7 +683,10 @@ class _DashboardState extends State<Dashboard> {
                           ),
                         ],
                       ),
-                    ] else if (page == 1)
+                    ] else if (page == 1) ...[
+                      if (s['supports_direct_upload'] == true)
+                        directUploadPanel(s),
+                      const SizedBox(height: 20),
                       panel('Saved locally → uploaded', [
                         const Text(
                           'Wait for pending uploads to finish before switching computers.',
@@ -643,7 +698,7 @@ class _DashboardState extends State<Dashboard> {
                               Icons.check_circle_outline,
                               color: Colors.green,
                             ),
-                            title: Text('No pending uploads'),
+                            title: Text('No staged file uploads'),
                           ),
                         if (s['transfer'] != null) ...[
                           Text(
@@ -677,8 +732,8 @@ class _DashboardState extends State<Dashboard> {
                           icon: const Icon(Icons.refresh),
                           label: const Text('Retry pending transfers'),
                         ),
-                      ])
-                    else if (page == 2)
+                      ]),
+                    ] else if (page == 2)
                       panel('Activity', [
                         if ((s['events'] as List? ?? []).isEmpty)
                           const Text(
@@ -695,8 +750,56 @@ class _DashboardState extends State<Dashboard> {
                             ),
                           ),
                       ])
+                    else if (page == 4)
+                      sqlitePanel(s)
                     else
                       panel('Storage and startup', [
+                        const Text(
+                          'Choose how much file content Storage Bridge may keep on this PC. The limit includes pending writes and retained copies.',
+                        ),
+                        const SizedBox(height: 16),
+                        SizedBox(
+                          width: 270,
+                          child: TextField(
+                            key: const Key('content-limit'),
+                            enabled: !busy && s['storage'] is Map,
+                            controller: contentLimit,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'Local content limit (GiB)',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        LiquidGlassButton(
+                          onPressed: busy || s['storage'] is! Map
+                              ? null
+                              : () => act(() async {
+                                  final value = double.tryParse(
+                                    contentLimit.text,
+                                  );
+                                  if (value == null ||
+                                      !value.isFinite ||
+                                      value < .0625 ||
+                                      value > 16384) {
+                                    throw Exception(
+                                      'Enter a limit between 0.0625 and 16384 GiB.',
+                                    );
+                                  }
+                                  await request('settings', {
+                                    'content_limit': (value * 1073741824)
+                                        .round(),
+                                  });
+                                }),
+                          child: const Text('Save content limit'),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          s['storage'] is Map
+                              ? 'When space runs out, further growth is refused. Existing pending edits remain protected. Lowering the limit below protected content is refused.'
+                              : 'Restart with the updated engine to enable the enforced content limit.',
+                        ),
+                        const Divider(height: 36),
                         GlassSwitchTile(
                           contentPadding: EdgeInsets.zero,
                           title: const Text('Online-only mode'),
@@ -721,11 +824,12 @@ class _DashboardState extends State<Dashboard> {
                         SizedBox(
                           width: 240,
                           child: TextField(
+                            key: const Key('retained-cache-budget'),
                             enabled: !busy && s['online_only'] != true,
                             controller: cache,
                             keyboardType: TextInputType.number,
                             decoration: const InputDecoration(
-                              labelText: 'Maximum cache (GiB)',
+                              labelText: 'Retained clean cache (GiB)',
                             ),
                           ),
                         ),
@@ -748,12 +852,12 @@ class _DashboardState extends State<Dashboard> {
                                         .round(),
                                   });
                                 }),
-                          child: const Text('Save cache limit'),
+                          child: const Text('Save retention target'),
                         ),
                         GlassSwitchTile(
                           contentPadding: EdgeInsets.zero,
-                          title: const Text(
-                            'Reconnect when I sign in to Windows',
+                          title: Text(
+                            'Reconnect when I sign in to ${usesMacOS ? 'macOS' : 'Windows'}',
                           ),
                           subtitle: const Text(
                             'Start the engine and mount the last selected drive.',
@@ -852,6 +956,333 @@ class _DashboardState extends State<Dashboard> {
       ),
     ),
   );
+  Widget storagePanel(Map<String, dynamic> s) {
+    final storage = (s['storage'] as Map).cast<String, dynamic>();
+    final used = (storage['used_bytes'] as num? ?? 0).toDouble();
+    final limit = (storage['limit_bytes'] as num? ?? 1).toDouble();
+    final files = storage['files'] as List? ?? [];
+    const reasons = {
+      'pending_upload': 'Saved locally; awaiting upload',
+      'open_file': 'Uploaded copy still open in an application',
+      'retained_copy': 'Uploaded copy retained for reuse',
+      'recovery_data': 'Recovery data; retained for inspection',
+    };
+    return panel('Your local storage budget', [
+      Text(
+        '${bytes(storage['used_bytes'])} / ${bytes(storage['limit_bytes'])}',
+        style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+      ),
+      const SizedBox(height: 12),
+      LinearProgressIndicator(
+        value: (used / (limit > 0 ? limit : 1)).clamp(0.0, 1.0),
+      ),
+      const SizedBox(height: 12),
+      Text(
+        '${bytes(storage['available_bytes'])} available for new local content',
+      ),
+      const SizedBox(height: 8),
+      Text(
+        'Read buffer (RAM): ${bytes(s['read_cache_bytes'])} / ${bytes(s['read_cache_budget'])}',
+      ),
+      const SizedBox(height: 12),
+      if (storage['over_limit'] == true)
+        banner(
+          'Existing content exceeds this limit. It is preserved for recovery. Further growth is blocked until uploads finish or you raise the limit.',
+        )
+      else if (storage['write_blocked'] == true)
+        banner(
+          'Storage limit reached. Close files and let uploads finish, or raise the limit in Settings before retrying. Previously accepted edits are retained.',
+        ),
+      const Text(
+        'Cloud reads use RAM without full local copies. New and changed bytes stay on disk until Google confirms the upload.',
+      ),
+      const SizedBox(height: 12),
+      Wrap(
+        spacing: 20,
+        runSpacing: 8,
+        children: [
+          Text('Pending writes: ${bytes(storage['pending_bytes'])}'),
+          Text('Retained copies: ${bytes(storage['retained_bytes'])}'),
+          Text('Recovery data: ${bytes(storage['recovery_bytes'])}'),
+        ],
+      ),
+      const SizedBox(height: 12),
+      ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        title: const Text('Why space is used'),
+        subtitle: Text(
+          '${storage['file_count'] ?? files.length} local content files',
+        ),
+        children: [
+          if (files.isEmpty)
+            const ListTile(title: Text('No file content stored on disk')),
+          for (final file in files)
+            ListTile(
+              title: Text(file['name'].toString()),
+              subtitle: Text(
+                reasons[file['reason']] ?? 'Protected local content',
+              ),
+              trailing: Text(bytes(file['bytes'])),
+            ),
+          if (storage['files_truncated'] == true)
+            const ListTile(
+              title: Text(
+                'Showing the 100 largest local content files. Totals include all files.',
+              ),
+            ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          LiquidGlassButton(
+            onPressed: busy
+                ? null
+                : () => act(() async {
+                    await request('release_cache');
+                  }),
+            child: const Text('Free completed copies'),
+          ),
+          LiquidGlassButton(
+            onPressed: busy
+                ? null
+                : () => act(() async {
+                    final summary = Map<String, dynamic>.from(storage)
+                      ..remove('files');
+                    await Clipboard.setData(
+                      ClipboardData(
+                        text: const JsonEncoder.withIndent('  ').convert({
+                          'application': 'Storage Bridge',
+                          'version': _version,
+                          'captured_at': DateTime.now()
+                              .toUtc()
+                              .toIso8601String(),
+                          'streaming': s['streaming'],
+                          'online_only': s['online_only'],
+                          'read_cache_bytes': s['read_cache_bytes'],
+                          'read_cache_budget': s['read_cache_budget'],
+                          'storage': summary,
+                        }),
+                      ),
+                    );
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'Storage report copied. Filenames and account details are excluded.',
+                          ),
+                        ),
+                      );
+                    }
+                  }),
+            child: const Text('Copy storage report'),
+          ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      const Text(
+        'Limit covers managed file-content lengths, including write journals. App files, metadata, filesystem overhead, Windows/macOS paging, and other apps are separate. Explorer/Finder allocation figures are not this PC’s cache usage.',
+        style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
+      ),
+    ]);
+  }
+
+  Widget directUploadPanel(Map<String, dynamic> s) {
+    final jobs = (s['direct_uploads']?['jobs'] as List?) ?? [];
+    final available = !busy && s['connected'] == true;
+    return panel('Direct upload · no second local copy', [
+      const Text(
+        'Upload a file directly from its current location. It can exceed your local content limit. Keep it in place and close it in other apps until verification finishes. Explorer Cut/Paste still uses the staged upload path.',
+      ),
+      const SizedBox(height: 16),
+      LiquidGlassButton(
+        onPressed: available
+            ? () => act(() async {
+                final path = await native.invokeMethod<String>('chooseSource');
+                if (path != null && mounted) setState(() => sourcePath = path);
+              })
+            : null,
+        child: const Text('Choose local file'),
+      ),
+      if (sourcePath != null)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: SelectableText(sourcePath!),
+        ),
+      const SizedBox(height: 12),
+      TextField(
+        key: const Key('import-folder'),
+        controller: importFolder,
+        enabled: !busy,
+        decoration: const InputDecoration(
+          labelText: 'Destination folder inside StorageBridge',
+          helperText:
+              'Leave blank for the mounted root. Existing folders only.',
+        ),
+      ),
+      const SizedBox(height: 12),
+      GlassSwitchTile(
+        title: const Text('Move after verified upload'),
+        subtitle: Text(
+          s['supports_move_source'] == true
+              ? 'Remove the original only after Google confirms its size and SHA-256 checksum. Failed verification retains it.'
+              : 'Automatic removal is available on Windows. Direct upload on macOS retains the original.',
+        ),
+        value: moveSource && s['supports_move_source'] == true,
+        onChanged: available && s['supports_move_source'] == true
+            ? (value) => setState(() => moveSource = value)
+            : null,
+      ),
+      const SizedBox(height: 12),
+      glassAction(
+        onPressed: available && sourcePath != null
+            ? () => act(() async {
+                await request('import_file', {
+                  'source_path': sourcePath,
+                  'folder': importFolder.text.trim(),
+                  'move_source':
+                      moveSource && s['supports_move_source'] == true,
+                });
+                if (mounted) setState(() => sourcePath = null);
+              })
+            : null,
+        icon: const Icon(Icons.cloud_upload_outlined),
+        label: Text(
+          moveSource && s['supports_move_source'] == true
+              ? 'Upload and move'
+              : 'Upload directly',
+        ),
+      ),
+      const SizedBox(height: 12),
+      Text(
+        '${bytes(s['direct_uploads']?['source_bytes'])} in pending original files · outside the managed content allowance',
+      ),
+      for (final job in jobs)
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(
+            job['state'] == 'complete'
+                ? Icons.check_circle_outline
+                : Icons.upload_file_outlined,
+          ),
+          title: Text('${job['name']} · ${bytes(job['size'])}'),
+          subtitle: Text(
+            '${job['move_source'] == true ? 'Move' : 'Copy'} · ${job['state'].toString().replaceAll('_', ' ')}'
+            '${job['error'] == null ? '' : '\n${job['error']}'}',
+          ),
+          trailing: job['error'] != null && job['state'] != 'source_retained'
+              ? TextButton(
+                  onPressed: busy
+                      ? null
+                      : () => act(() async {
+                          await request('dismiss_import', {'id': job['id']});
+                        }),
+                  child: const Text('Dismiss'),
+                )
+              : null,
+        ),
+      const Text(
+        'SQLite uploads require a closed, standalone backup in DELETE journal mode. No WAL or journal sidecars. Dismissing a failed job retains the source and any uploaded cloud file.',
+        style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
+      ),
+    ]);
+  }
+
+  Widget sqlitePanel(Map<String, dynamic> s) {
+    final query = (s['sqlite_query'] as Map?) ?? {};
+    final result = (query['result'] as Map?) ?? {};
+    final columns = (result['columns'] as List?) ?? [];
+    final rows = (result['rows'] as List?) ?? [];
+    final running = query['state'] == 'running';
+    return panel('Read-only cloud SQLite', [
+      const Text(
+        'Query a closed, standalone SQLite snapshot on Drive. Needed pages stream into the shared RAM buffer; no database copy is created on disk. Indexed lookups avoid reading the full database. Full scans can still transfer every page.',
+      ),
+      const SizedBox(height: 12),
+      const Text(
+        'This reader does not edit databases. Live databases, WAL, attached files and temporary sorts are unsupported. Export a backup in DELETE journal mode first.',
+      ),
+      const SizedBox(height: 16),
+      TextField(
+        key: const Key('sqlite-path'),
+        controller: databasePath,
+        enabled: !busy && !running,
+        decoration: const InputDecoration(
+          labelText: 'Database path inside StorageBridge',
+          hintText: 'backups/data.sqlite',
+        ),
+      ),
+      const SizedBox(height: 16),
+      TextField(
+        key: const Key('sqlite-sql'),
+        controller: sql,
+        minLines: 3,
+        maxLines: 8,
+        enabled: !busy && !running,
+        decoration: const InputDecoration(labelText: 'Read-only SQL query'),
+      ),
+      const SizedBox(height: 16),
+      glassAction(
+        onPressed:
+            !busy &&
+                !running &&
+                s['connected'] == true &&
+                s['supports_sqlite_query'] == true
+            ? () => act(() async {
+                await request('sqlite_query', {
+                  'path': databasePath.text.trim(),
+                  'sql': sql.text,
+                });
+              })
+            : null,
+        icon: const Icon(Icons.play_arrow),
+        label: const Text('Run read-only query'),
+      ),
+      if (running)
+        const Padding(
+          padding: EdgeInsets.only(top: 16),
+          child: LinearProgressIndicator(),
+        ),
+      if (query['error'] != null) banner(query['error'].toString()),
+      if (query['state'] == 'complete') ...[
+        const SizedBox(height: 16),
+        Text(
+          '${rows.length} rows · snapshot ${result['version']} · ${bytes(result['file_size'])} cloud file',
+        ),
+        if (result['truncated'] == true)
+          banner(
+            'Result limited to 200 rows or 256 KiB. Refine your query. Text cells are limited to 1024 characters; blobs show their size.',
+          ),
+        if (columns.isNotEmpty)
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: DataTable(
+              columns: [
+                for (final column in columns)
+                  DataColumn(label: Text(column.toString())),
+              ],
+              rows: [
+                for (final row in rows)
+                  DataRow(
+                    cells: [
+                      for (final value in row as List)
+                        DataCell(SelectableText(value?.toString() ?? 'NULL')),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+      ],
+      const SizedBox(height: 12),
+      const Text(
+        'Results show up to 200 rows / 256 KiB. Text cells are limited to 1024 characters; blobs show their size. Results are discarded if the cloud revision changes. Queries have a 30-second execution check; a network request may take longer. SQLite working memory and OS paging are separate from the 32 MiB read buffer.',
+        style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
+      ),
+    ]);
+  }
+
   Widget panel(String title, List<Widget> children) => SizedBox(
     width: double.infinity,
     child: LiquidGlassSurface(

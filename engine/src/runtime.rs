@@ -17,6 +17,7 @@ pub struct Runtime {
     gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     initialize: Mutex<()>,
     listings: Mutex<HashSet<String>>,
+    pub query_state: Arc<Mutex<serde_json::Value>>,
 }
 struct ReadLease {
     engine: Arc<Mutex<Engine>>,
@@ -38,6 +39,7 @@ impl Runtime {
             gates: Mutex::new(HashMap::new()),
             initialize: Mutex::new(()),
             listings: Mutex::new(HashSet::new()),
+            query_state: Arc::new(Mutex::new(serde_json::json!({"state":"idle"}))),
         }
     }
     pub fn gate(&self, id: &str) -> Arc<Mutex<()>> {
@@ -134,7 +136,8 @@ impl Runtime {
     pub fn resolve(&self, path: &str) -> Result<Node> {
         let mut current = {
             let e = self.engine.lock();
-            e.store.get(&e.root_id())?
+            let root_id = e.root_id()?;
+            e.store.get(&root_id)?
         };
         for part in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
             ensure!(
@@ -224,6 +227,7 @@ impl Runtime {
                     let mut e = self.engine.lock();
                     let mut current = e.store.get(id)?;
                     current.version = fresh.version.clone();
+                    current.head_revision = fresh.head_revision.clone();
                     current.size = fresh.size;
                     current.modified = fresh.modified;
                     e.store.put(&current)?;
@@ -261,6 +265,7 @@ impl Runtime {
         let e = self.engine.lock();
         let mut n = e.store.get(id)?;
         n.version = fresh.version;
+        n.head_revision = fresh.head_revision;
         n.size = fresh.size;
         n.modified = fresh.modified;
         e.store.put(&n)
@@ -316,6 +321,9 @@ impl Runtime {
         let end = start
             .checked_add(count as u64)
             .context("File offset overflow")?;
+        let writes = e.content_writes.clone();
+        let _content_guard = writes.lock();
+        e.check_content_growth(count as u64, Some(id))?;
         let mut file = std::fs::OpenOptions::new().append(true).open(e.cache(id))?;
         let stored = file.seek(SeekFrom::End(0))?;
         file.write_all(&bytes[..count])?;
@@ -462,8 +470,9 @@ impl Runtime {
             }
         }
         let (changes, next) = worker.remote.changes(&cursor)?;
+        let root_id = worker.root_id()?;
         for (id, node) in changes {
-            if id == worker.root_id() && node.is_none() {
+            if id == root_id && node.is_none() {
                 anyhow::bail!("The StorageBridge folder was removed. Restore it in Google Drive.");
             }
             let included = node

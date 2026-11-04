@@ -1,6 +1,6 @@
 # Storage Bridge desktop
 
-Flutter Windows UI for the Storage Bridge engine.
+Flutter Windows and macOS UI for the Storage Bridge engine.
 
 The interface uses LiquidGlassSurface, LiquidGlassNavigationBar,
 LiquidGlassButton, LiquidGlassIconButton, and LiquidGlassSwitch directly from
@@ -16,3 +16,5 @@ Place the Rust engine beside the desktop executable as described in the root REA
 The icon is in `assets/storage_bridge.png` and
 `windows/runner/resources/app_icon.ico`. Regenerate both using
 `python tool/generate_icon.py` (Pillow required).
+
+For macOS use `./scripts/build-macos.sh` from the repository root as described in the root README. The Swift runner provides OAuth JSON selection, Finder access, engine launch/IPC, and menu bar controls. The packaged engine lives at `StorageBridge.app/Contents/MacOS/storage-bridge`. The desktop app is intentionally not App Sandbox enabled because it launches a separate filesystem daemon.

@@ -95,6 +95,17 @@ DesktopBridge::DesktopBridge(flutter::BinaryMessenger* messenger, HWND window) :
       }
       if (call.method_name() == "launch") {
         Launch(call.arguments() && std::holds_alternative<bool>(*call.arguments()) && std::get<bool>(*call.arguments()));
+      } else if (call.method_name() == "chooseSource") {
+        wchar_t file[32768]{};
+        OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = window_; dialog.lpstrFile = file; dialog.nMaxFile = 32768;
+        dialog.lpstrFilter = L"Local files\0*.*\0\0"; dialog.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&dialog)) { result->Success(); return; }
+        int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, file, -1, nullptr, 0, nullptr, nullptr);
+        if (!size) throw std::runtime_error("Cannot encode source path");
+        std::string path(size, '\0');
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, file, -1, path.data(), size, nullptr, nullptr);
+        path.pop_back();
+        result->Success(flutter::EncodableValue(path)); return;
       } else if (call.method_name() == "chooseClient") {
         wchar_t file[32768]{};
         OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = window_; dialog.lpstrFile = file; dialog.nMaxFile = 32768;

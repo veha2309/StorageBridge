@@ -30,6 +30,7 @@ pub struct Engine {
     pub(crate) metadata_only: bool,
     pub read_cache: Arc<crate::streaming::ReadCache>,
     pub(crate) read_views: HashMap<String, Node>,
+    pub(crate) content_writes: Arc<parking_lot::Mutex<()>>,
 }
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -48,6 +49,7 @@ impl Engine {
             metadata_only: false,
             read_cache: Arc::new(crate::streaming::ReadCache::default()),
             read_views: HashMap::new(),
+            content_writes: Arc::new(parking_lot::Mutex::new(())),
         };
         for mut node in engine.store.all()? {
             if node.dirty
@@ -89,10 +91,24 @@ impl Engine {
             metadata_only: false,
             read_cache: self.read_cache.clone(),
             read_views: HashMap::new(),
+            content_writes: self.content_writes.clone(),
         })
     }
-    pub fn root_id(&self) -> String {
-        self.store.setting("root_id").unwrap_or("root".into())
+    pub fn root_id(&self) -> Result<String> {
+        self.store
+            .setting("root_id")
+            .context("Root metadata is missing (root_id not set); the drive must be reinitialized")
+    }
+
+    pub fn root_node(&self) -> Result<Node> {
+        let id = self.root_id()?;
+        let node = self
+            .store
+            .get(&id)
+            .with_context(|| format!("Root node '{id}' is missing from the metadata store"))?;
+        ensure!(node.directory, "Root node '{id}' is not a directory");
+        ensure!(!node.deleted, "Root node '{id}' is marked deleted");
+        Ok(node)
     }
     pub fn configure_scope(&mut self, name: &str) -> Result<()> {
         if self.store.setting("scope_folder").as_deref() == Some(name) {
@@ -162,6 +178,7 @@ impl Engine {
                     directory: true,
                     size: 0,
                     version: String::new(),
+                    head_revision: None,
                     cached: false,
                     dirty: false,
                     deleted: false,
@@ -177,7 +194,7 @@ impl Engine {
         if self.store.setting("scope_folder").is_none() {
             return Ok(true);
         }
-        let root = self.root_id();
+        let root = self.root_id()?;
         if node.id == root {
             return Ok(true);
         }
@@ -210,6 +227,14 @@ impl Engine {
             .context("Google Drive root was not found")?;
         let mut root = self.scoped_root(account_root)?;
         ensure!(root.directory, "The mount root must be a folder");
+        let stored_ok = matches!(
+            self.store.setting("root_id"),
+            Some(id) if id == root.id
+                && self.store.get(&id).map(|n| n.directory && !n.deleted).unwrap_or(false)
+        );
+        if !stored_ok {
+            self.reset_metadata()?;
+        }
         root.alias = "".into();
         self.store.set("root_id", &root.id)?;
         self.store.put(&root)?;
@@ -219,6 +244,30 @@ impl Engine {
         }
         let about = self.remote.about()?;
         self.store.set("about", &about.to_string())?;
+        Ok(())
+    }
+    fn reset_metadata(&mut self) -> Result<()> {
+        let pending: u32 = self
+            .store
+            .db
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))?;
+        ensure!(
+            pending == 0 && self.store.all()?.iter().all(|n| !n.dirty),
+            "Root metadata is invalid but pending uploads exist; refusing to discard them"
+        );
+        for node in self.store.all()? {
+            let p = self.cache(&node.id);
+            if p.exists() {
+                std::fs::remove_file(p)?;
+            }
+        }
+        let tx = self.store.db.transaction()?;
+        tx.execute("DELETE FROM nodes", [])?;
+        tx.execute(
+            "DELETE FROM settings WHERE key IN ('root_id','cursor') OR key LIKE 'listed:%'",
+            [],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn cache(&self, id: &str) -> PathBuf {
@@ -322,7 +371,7 @@ impl Engine {
         self.children(parent)
     }
     pub fn resolve(&mut self, path: &str) -> Result<Node> {
-        let mut current = self.store.get(&self.root_id())?;
+        let mut current = self.root_node()?;
         for part in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
             ensure!(
                 part != "." && part != ".." && !part.contains(':'),
@@ -375,10 +424,26 @@ impl Engine {
             );
             let part = path.with_extension("download");
             let _partial = PartialDownload(part.clone());
-            if let Err(e) = self.remote.download(id, &part) {
-                let _ = std::fs::remove_file(&part);
-                return Err(e).context("File is not available offline; reconnect to download it");
+            let writes = self.content_writes.clone();
+            let _guard = writes.lock();
+            self.check_content_growth(n.size, Some(id))?;
+            let mut file = File::create(&part)?;
+            let mut offset = 0;
+            while offset < n.size {
+                let length = (n.size - offset).min(crate::streaming::BLOCK as u64) as usize;
+                let bytes = self
+                    .remote
+                    .read_range(&n, offset, length)
+                    .context("File is not available offline; reconnect to download it")?;
+                ensure!(
+                    bytes.len() == length,
+                    "Incomplete download; retry opening the file"
+                );
+                file.write_all(&bytes)?;
+                offset += length as u64;
             }
+            file.sync_all()?;
+            drop(file);
             ensure!(
                 std::fs::metadata(&part)?.len() == n.size,
                 "Incomplete download; retry opening the file"
@@ -423,6 +488,12 @@ impl Engine {
         if length == 0 {
             return Ok(0);
         }
+        let end = offset
+            .checked_add(length as u64)
+            .context("File offset overflow")?;
+        let writes = self.content_writes.clone();
+        let _guard = writes.lock();
+        self.check_content_growth(end.saturating_sub(n.size), Some(id))?;
         // Journal dirty state before modifying content; worker is serialized with writes.
         n.dirty = true;
         self.store.stage(&n, "reconcile")?;
@@ -439,6 +510,9 @@ impl Engine {
     }
     pub fn resize(&mut self, id: &str, size: u64) -> Result<()> {
         let mut n = self.hydrate(id)?;
+        let writes = self.content_writes.clone();
+        let _guard = writes.lock();
+        self.check_content_growth(size.saturating_sub(n.size), Some(id))?;
         n.dirty = true;
         self.store.stage(&n, "reconcile")?;
         let f = OpenOptions::new().write(true).open(self.cache(id))?;
@@ -490,6 +564,7 @@ impl Engine {
             directory,
             size: 0,
             version: String::new(),
+            head_revision: None,
             cached: !directory,
             dirty: true,
             deleted: false,
@@ -515,7 +590,7 @@ impl Engine {
     }
     pub fn can_delete(&mut self, id: &str) -> Result<()> {
         let n = self.store.get(id)?;
-        ensure!(n.id != self.root_id(), "Cannot delete the drive root");
+        ensure!(n.id != self.root_id()?, "Cannot delete the drive root");
         if n.directory {
             ensure!(self.list(id)?.is_empty(), "Directory is not empty");
         }
@@ -531,10 +606,11 @@ impl Engine {
         let (parent, name) = split(path)?;
         let parent = self.resolve(parent)?;
         let mut n = self.store.get(id)?;
-        ensure!(parent.directory && n.id != self.root_id(), "Invalid rename");
+        let root_id = self.root_id()?;
+        ensure!(parent.directory && n.id != root_id, "Invalid rename");
         let mut ancestor = parent.clone();
         let mut seen = HashSet::new();
-        while ancestor.id != self.root_id() {
+        while ancestor.id != root_id {
             ensure!(
                 ancestor.id != id && seen.insert(ancestor.id.clone()),
                 "Cannot move a directory into itself"
@@ -670,6 +746,24 @@ impl Engine {
                         .map(|x| x.alias.to_lowercase())
                         .collect();
                     conflict.alias = names::alias(&conflict.name, &conflict.id, &occupied);
+                    // Detached upload workers must not evict using their open-handle snapshot.
+                    // Reserve the duplicate under the shared lock, preserving the source on failure.
+                    let writes = self.content_writes.clone();
+                    let _guard = writes.lock();
+                    let used = self.content_bytes()?;
+                    let additional = std::fs::metadata(self.cache(id))?.len();
+                    let limit = self.content_limit();
+                    if used
+                        .checked_add(additional)
+                        .is_none_or(|total| total > limit)
+                    {
+                        return Err(crate::storage::ContentLimitExceeded {
+                            used,
+                            additional,
+                            limit,
+                        }
+                        .into());
+                    }
                     std::fs::copy(self.cache(id), self.cache(&conflict.id))?;
                     OpenOptions::new()
                         .write(true)
@@ -834,6 +928,9 @@ impl Engine {
         if self.store.setting("cursor").is_none() {
             return self.initialize();
         }
+        let root_id = self.root_id()?;
+        self.root_node()
+            .context("Root metadata is invalid; reinitialize before polling")?;
         let pending: Vec<_> = self.refresh.iter().cloned().collect();
         for id in pending {
             if self.open.get(&id).copied().unwrap_or(0) == 0 {
@@ -848,7 +945,7 @@ impl Engine {
         let cursor = self.store.setting("cursor").unwrap();
         let (changes, next) = self.remote.changes(&cursor)?;
         for (id, n) in changes {
-            if id == self.root_id() && n.is_none() {
+            if id == root_id && n.is_none() {
                 anyhow::bail!("The StorageBridge folder was removed. Restore it in Google Drive.");
             }
             if let Some(n) = n
@@ -867,6 +964,8 @@ impl Engine {
         Ok(())
     }
     pub fn evict(&mut self) -> Result<()> {
+        let writes = self.content_writes.clone();
+        let _guard = writes.lock();
         let online_only = self.online_only();
         let budget = if online_only {
             0
@@ -875,8 +974,9 @@ impl Engine {
                 .setting("cache_budget")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_BUDGET)
+                .min(self.content_limit())
         };
-        let mut nodes = self.store.all()?;
+        let nodes = self.store.all()?;
         for n in &nodes {
             if !n.cached
                 && !n.dirty
@@ -887,36 +987,7 @@ impl Engine {
                 std::fs::remove_file(self.cache(&n.id))?;
             }
         }
-        let mut total: u64 = nodes
-            .iter()
-            .filter(|n| n.cached)
-            .map(|n| {
-                std::fs::metadata(self.cache(&n.id))
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            })
-            .sum();
-        nodes.sort_by_key(|n| n.last_access);
-        for mut n in nodes {
-            if total <= budget {
-                break;
-            }
-            if n.cached
-                && !n.dirty
-                && !self.has_job(&n.id)
-                && self.open.get(&n.id).copied().unwrap_or(0) == 0
-            {
-                let size = std::fs::metadata(self.cache(&n.id))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if self.cache(&n.id).exists() {
-                    std::fs::remove_file(self.cache(&n.id))?;
-                }
-                n.cached = false;
-                self.store.put(&n)?;
-                total = total.saturating_sub(size);
-            }
-        }
+        let total = self.trim_content(budget, None)?;
         if !online_only && total > budget {
             self.last_error =
                 Some("Cache exceeds budget because files are open or awaiting upload".into());
@@ -927,6 +998,14 @@ impl Engine {
         self.store
             .db
             .execute("UPDATE jobs SET next_try=0,attempts=0,error=NULL", [])?;
+        for mut job in crate::imports::Import::all(&self.store)? {
+            if !job.terminal() {
+                job.next_try = 0;
+                job.attempts = 0;
+                job.error = None;
+                job.save(&self.store)?;
+            }
+        }
         Ok(())
     }
     pub fn status(&self) -> Result<Value> {
@@ -944,22 +1023,10 @@ impl Engine {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let transfers:Vec<_>=jobs.into_iter().map(|(id,attempts,error)|json!({"id":id,"name":self.store.get(&id).map(|n|n.alias).unwrap_or(id.clone()),"state":if error.is_some(){"retrying"}else if self.open.contains_key(&id){"saved_locally"}else{"queued"},"attempts":attempts,"error":error})).collect();
-        let cache = std::fs::read_dir(self.root.join("cache"))?.try_fold(
-            0u64,
-            |total, entry| -> Result<u64> {
-                let metadata = match entry?.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(total),
-                    Err(error) => return Err(error.into()),
-                };
-                Ok(total
-                    + if metadata.is_file() {
-                        metadata.len()
-                    } else {
-                        0
-                    })
-            },
-        )?;
+        let storage = self.storage_usage()?;
+        let direct = crate::imports::status(&self.store)?;
+        let pending = transfers.len() as u64 + direct["pending"].as_u64().unwrap_or(0);
+        let cache = storage.used_bytes;
         let mut stmt = self
             .store
             .db
@@ -970,7 +1037,7 @@ impl Engine {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(
-            json!({"open_files":self.open.len(),"streaming":true,"read_cache_bytes":self.read_cache.bytes(),"read_cache_budget":crate::streaming::RAM_BUDGET,"online_only":self.online_only(),"pending":transfers.len(),"transfers":transfers,"cache_bytes":cache,"cache_budget":self.store.setting("cache_budget").and_then(|s|s.parse::<u64>().ok()).unwrap_or(DEFAULT_BUDGET),"startup":self.store.setting("startup").as_deref()==Some("true"),"drive_letter":self.store.setting("drive_letter").unwrap_or("G:".into()),"last_error":self.last_error,"about":self.store.setting("about").and_then(|s|serde_json::from_str::<Value>(&s).ok()),"events":events}),
+            json!({"open_files":self.open.len(),"streaming":true,"direct_uploads":direct,"supports_direct_upload":true,"supports_move_source":cfg!(windows),"supports_sqlite_query":true,"storage":storage,"read_cache_bytes":self.read_cache.bytes(),"read_cache_budget":crate::streaming::RAM_BUDGET,"online_only":self.online_only(),"pending":pending,"transfers":transfers,"cache_bytes":cache,"cache_budget":self.store.setting("cache_budget").and_then(|s|s.parse::<u64>().ok()).unwrap_or(DEFAULT_BUDGET),"startup":self.store.setting("startup").as_deref()==Some("true"),"drive_letter":self.store.setting("drive_letter").unwrap_or("G:".into()),"last_error":self.last_error,"about":self.store.setting("about").and_then(|s|serde_json::from_str::<Value>(&s).ok()),"events":events}),
         )
     }
 }

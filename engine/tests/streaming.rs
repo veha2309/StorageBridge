@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -24,6 +24,8 @@ struct Observed {
     listings: AtomicUsize,
     full: AtomicUsize,
     pattern: AtomicBool,
+    sequential: AtomicBool,
+    virtual_size: AtomicU64,
     block_read: AtomicBool,
     block_upload: AtomicBool,
     started: Mutex<Option<mpsc::Sender<()>>>,
@@ -52,6 +54,13 @@ impl Observed {
     }
 }
 impl Remote for Observed {
+    fn sequential_range_size(&self) -> usize {
+        if self.sequential.load(Ordering::SeqCst) {
+            storage_bridge::streaming::MAX_RANGE
+        } else {
+            BLOCK
+        }
+    }
     fn list(&self, p: &str) -> Result<Vec<Node>> {
         self.listings.fetch_add(1, Ordering::SeqCst);
         self.inner.list(p)
@@ -62,7 +71,7 @@ impl Remote for Observed {
             && let Some(n) = &mut n
             && !n.directory
         {
-            n.size = 8 * 1024 * 1024 * 1024;
+            n.size = self.virtual_size.load(Ordering::SeqCst);
         }
         Ok(n)
     }
@@ -75,11 +84,25 @@ impl Remote for Observed {
     }
     fn read_range(&self, n: &Node, offset: u64, length: usize) -> Result<Vec<u8>> {
         self.ranges.fetch_add(1, Ordering::SeqCst);
-        assert!(length <= BLOCK);
+        assert!(
+            length
+                <= if self.sequential.load(Ordering::SeqCst) {
+                    storage_bridge::streaming::MAX_RANGE
+                } else {
+                    BLOCK
+                }
+        );
         if self.block_read.load(Ordering::SeqCst) {
             self.block();
         }
         if self.pattern.load(Ordering::SeqCst) {
+            if self.sequential.load(Ordering::SeqCst) {
+                let mut data = vec![0; length];
+                for (index, block) in data.chunks_mut(BLOCK).enumerate() {
+                    block.fill(((offset / BLOCK as u64 + index as u64) % 251) as u8);
+                }
+                return Ok(data);
+            }
             return Ok((0..length)
                 .map(|i| ((offset + i as u64) % 251) as u8)
                 .collect());
@@ -119,6 +142,8 @@ fn setup() -> (tempfile::TempDir, Arc<Observed>, Arc<Runtime>, String) {
         listings: AtomicUsize::new(0),
         full: AtomicUsize::new(0),
         pattern: AtomicBool::new(false),
+        sequential: AtomicBool::new(false),
+        virtual_size: AtomicU64::new(8 * 1024 * 1024 * 1024),
         block_read: AtomicBool::new(false),
         block_upload: AtomicBool::new(false),
         started: Mutex::new(None),
@@ -233,6 +258,65 @@ fn random_reads_of_eight_gib_file_use_only_bounded_ram() {
     drop(e);
     assert_eq!(rt.read(&id, 8 * 1024 * 1024 * 1024, &mut []).unwrap(), 0);
 }
+#[test]
+fn complete_three_point_two_gib_read_crosses_two_gib_without_disk_growth() {
+    let (_tmp, remote, rt, id) = setup();
+    let size = 3_410_694_231u64;
+    remote.pattern.store(true, Ordering::SeqCst);
+    remote.sequential.store(true, Ordering::SeqCst);
+    remote.virtual_size.store(size, Ordering::SeqCst);
+    {
+        let mut e = rt.engine.lock();
+        let mut n = e.store.get(&id).unwrap();
+        n.size = size;
+        e.store.put(&n).unwrap();
+        e.open_node(&id).unwrap();
+    }
+    let mut buffer = vec![0; BLOCK];
+    let mut expected = vec![0; BLOCK];
+    let mut offset = 0;
+    while offset < size {
+        let count = rt.read(&id, offset, &mut buffer).unwrap();
+        assert_eq!(count as u64, (size - offset).min(BLOCK as u64));
+        expected.fill(((offset / BLOCK as u64) % 251) as u8);
+        assert_eq!(
+            &buffer[..count],
+            &expected[..count],
+            "Corruption at {offset}"
+        );
+        assert!(rt.engine.lock().read_cache.bytes() <= RAM_BUDGET);
+        offset += count as u64;
+    }
+    assert_eq!(offset, size);
+    assert_eq!(rt.read(&id, offset, &mut buffer).unwrap(), 0);
+    let mut e = rt.engine.lock();
+    assert_eq!(e.content_bytes().unwrap(), 0);
+    assert!(!e.cache(&id).exists());
+    e.close_node(&id);
+    assert!(
+        remote.ranges.load(Ordering::SeqCst) < 420,
+        "Sequential reads did not batch"
+    );
+    assert_eq!(remote.full.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn read_cache_survives_metadata_bumps_but_not_blob_revision_changes() {
+    let (_tmp, remote, rt, id) = setup();
+    remote.pattern.store(true, Ordering::SeqCst);
+    let mut node = remote.get(&id).unwrap().unwrap();
+    node.head_revision = Some("blob-1".into());
+    let cache = rt.engine.lock().read_cache.clone();
+    let mut bytes = [0; 64];
+    cache.read(remote.as_ref(), &node, 0, &mut bytes).unwrap();
+    node.version = "metadata-13".into();
+    cache.read(remote.as_ref(), &node, 0, &mut bytes).unwrap();
+    assert_eq!(remote.ranges.load(Ordering::SeqCst), 1);
+    node.head_revision = Some("blob-2".into());
+    cache.read(remote.as_ref(), &node, 0, &mut bytes).unwrap();
+    assert_eq!(remote.ranges.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn small_edits_stage_only_changed_bytes_and_stream_upload() {
     let (tmp, remote, rt, id) = setup();

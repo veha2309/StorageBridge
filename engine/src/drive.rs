@@ -7,15 +7,78 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{fs::File, io::Read, path::Path, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    io::Read,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 const API: &str = "https://www.googleapis.com/drive/v3";
-const FIELDS: &str = "id,name,mimeType,parents,size,version,modifiedTime,trashed";
+const FIELDS: &str = "id,name,mimeType,parents,size,version,headRevisionId,modifiedTime,trashed";
+
+#[derive(Debug)]
+struct DriveHttpError(u16);
+impl std::fmt::Display for DriveHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Google Drive HTTP {}: {}",
+            self.0,
+            match self.0 {
+                401 => "Sign in again",
+                403 => "Permission denied or Google quota exceeded",
+                429 => "Rate limited; retrying later",
+                507 => "Storage full",
+                _ => "Request failed; pending work is retained",
+            }
+        )
+    }
+}
+impl std::error::Error for DriveHttpError {}
+#[derive(Debug)]
+struct IncompleteRange;
+impl std::fmt::Display for IncompleteRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Incomplete ranged response")
+    }
+}
+impl std::error::Error for IncompleteRange {}
+fn retryable_read(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<DriveHttpError>()
+            .is_some_and(|e| matches!(e.0, 408 | 429 | 500 | 502 | 503 | 504))
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|e| e.is_timeout() || e.is_connect() || e.is_body())
+            || cause.is::<IncompleteRange>()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                )
+            })
+    })
+}
 
 pub type ChangeBatch = (Vec<(String, Option<Node>)>, String);
 pub trait Remote: Send + Sync {
+    fn sequential_range_size(&self) -> usize {
+        crate::streaming::BLOCK
+    }
     fn list(&self, parent: &str) -> Result<Vec<Node>>;
     fn get(&self, id: &str) -> Result<Option<Node>>;
+    /// A provider-confirmed checksum for exactly this revision; None must never permit deletion.
+    fn sha256(&self, _node: &Node) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn generate_id(&self) -> Result<String>;
     fn download(&self, id: &str, target: &Path) -> Result<()>;
     fn read_range(&self, _node: &Node, _offset: u64, _length: usize) -> Result<Vec<u8>> {
@@ -44,6 +107,7 @@ pub struct GoogleDrive {
     http: Client,
     pub progress: Arc<Mutex<Option<Value>>>,
     range_tags: Mutex<std::collections::HashMap<(String, String), String>>,
+    range_window: AtomicUsize,
     #[cfg(test)]
     test_origin: Option<url::Url>,
 }
@@ -87,6 +151,7 @@ impl GoogleDrive {
                 .build()?,
             progress: Arc::new(Mutex::new(None)),
             range_tags: Mutex::new(std::collections::HashMap::new()),
+            range_window: AtomicUsize::new(crate::streaming::MAX_RANGE),
             #[cfg(test)]
             test_origin: None,
         })
@@ -113,18 +178,9 @@ impl GoogleDrive {
     }
     fn checked(response: Response) -> Result<Response> {
         let status = response.status();
-        anyhow::ensure!(
-            status.is_success(),
-            "Google Drive HTTP {}: {}",
-            status.as_u16(),
-            match status.as_u16() {
-                401 => "Sign in again",
-                403 => "Permission denied or Google quota exceeded",
-                429 => "Rate limited; retrying later",
-                507 => "Storage full",
-                _ => "Request failed; pending work is retained",
-            }
-        );
+        if !status.is_success() {
+            return Err(DriveHttpError(status.as_u16()).into());
+        }
         Ok(response)
     }
 }
@@ -137,6 +193,10 @@ fn node(v: Value) -> Result<Node> {
         directory: v["mimeType"] == "application/vnd.google-apps.folder",
         size: v["size"].as_str().unwrap_or("0").parse().unwrap_or(0),
         version: v["version"].as_str().unwrap_or("").into(),
+        head_revision: v["headRevisionId"]
+            .as_str()
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned),
         cached: false,
         dirty: false,
         deleted: v["trashed"].as_bool().unwrap_or(false),
@@ -154,6 +214,9 @@ fn supported(v: &Value) -> bool {
         || mime == "application/vnd.google-apps.folder"
 }
 impl Remote for GoogleDrive {
+    fn sequential_range_size(&self) -> usize {
+        self.range_window.load(Ordering::Relaxed)
+    }
     fn list(&self, parent: &str) -> Result<Vec<Node>> {
         let mut out = vec![];
         let mut page = String::new();
@@ -201,6 +264,22 @@ impl Remote for GoogleDrive {
         }
         Ok(Some(node(v)?))
     }
+    fn sha256(&self, n: &Node) -> Result<Option<String>> {
+        let value: Value = Self::checked(
+            self.request(reqwest::Method::GET, &format!("{API}/files/{}", n.id))?
+                .query(&[("fields", "id,size,version,sha256Checksum,trashed")])
+                .send()?,
+        )?
+        .json()?;
+        anyhow::ensure!(
+            value["trashed"] != true
+                && value["id"] == n.id
+                && value["version"].as_str() == Some(&n.version)
+                && value["size"].as_str().and_then(|s| s.parse::<u64>().ok()) == Some(n.size),
+            "Remote file changed during upload verification; original retained"
+        );
+        Ok(value["sha256Checksum"].as_str().map(str::to_lowercase))
+    }
     fn generate_id(&self) -> Result<String> {
         let v: Value = Self::checked(
             self.request(reqwest::Method::GET, &format!("{API}/files/generateIds"))?
@@ -238,69 +317,116 @@ impl Remote for GoogleDrive {
         if length == 0 || offset >= n.size {
             return Ok(vec![]);
         }
-        anyhow::ensure!(
-            length <= crate::streaming::BLOCK,
-            "Range request exceeds block limit"
-        );
-        let length = (n.size - offset).min(length as u64) as usize;
-        let end = offset + length as u64 - 1;
-        let key = (n.id.clone(), n.version.clone());
-        let tag = self.range_tags.lock().get(&key).cloned();
-        let mut request = self
-            .request(reqwest::Method::GET, &format!("{API}/files/{}", n.id))?
-            .query(&[("alt", "media")])
-            .header(header::RANGE, format!("bytes={offset}-{end}"))
-            .timeout(Duration::from_secs(20));
-        if let Some(tag) = &tag {
-            request = request.header(header::IF_MATCH, tag);
-        }
-        let response = request.send()?;
-        anyhow::ensure!(
-            response.status().as_u16() != 412,
-            "Remote file changed; close and reopen it"
-        );
-        let response = Self::checked(response)?;
-        let expected = format!("bytes {offset}-{end}/{}", n.size);
-        anyhow::ensure!(
-            response.status().as_u16() == 206
-                && response
-                    .headers()
-                    .get(header::CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    == Some(expected.as_str())
-                || response.status().as_u16() == 200 && offset == 0 && length as u64 == n.size,
-            "Google ignored the requested range; full download was refused"
-        );
-        let next_tag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .filter(|tag| !tag.starts_with("W/"))
-            .map(str::to_owned);
-        if let Some(tag) = &tag {
+        let read = |offset: u64, length: usize| -> Result<Vec<u8>> {
             anyhow::ensure!(
-                next_tag.as_ref() == Some(tag),
-                "Remote file changed during read"
+                length <= crate::streaming::MAX_RANGE,
+                "Range request exceeds block limit"
             );
-        }
-        let mut bytes = Vec::with_capacity(length);
-        response.take(length as u64 + 1).read_to_end(&mut bytes)?;
-        anyhow::ensure!(bytes.len() == length, "Incomplete ranged response");
-        if tag.is_none() {
-            let current = self.get(&n.id)?.context("Remote file was removed")?;
+            let length = (n.size - offset).min(length as u64) as usize;
+            let end = offset + length as u64 - 1;
+            let key = (n.id.clone(), n.content_version());
+            let content_revision = n.head_revision.as_deref().is_some_and(|r| !r.is_empty());
+            // A Drive media ETag can change with metadata. With a blob revision, validate
+            // that identity after every response instead of sending a stale If-Match.
+            let tag = if content_revision {
+                None
+            } else {
+                self.range_tags.lock().get(&key).cloned()
+            };
+            let mut request = self
+                .request(reqwest::Method::GET, &format!("{API}/files/{}", n.id))?
+                .query(&[("alt", "media")])
+                .header(header::RANGE, format!("bytes={offset}-{end}"))
+                .timeout(Duration::from_secs(20));
+            if let Some(tag) = &tag {
+                request = request.header(header::IF_MATCH, tag);
+            }
+            let response = request.send()?;
             anyhow::ensure!(
-                current.version == n.version,
+                response.status().as_u16() != 412,
                 "Remote file changed; close and reopen it"
             );
-            if let Some(tag) = next_tag {
-                let mut tags = self.range_tags.lock();
-                if tags.len() >= 256 {
-                    tags.clear();
+            let response = Self::checked(response)?;
+            let expected = format!("bytes {offset}-{end}/{}", n.size);
+            anyhow::ensure!(
+                response.status().as_u16() == 206
+                    && response
+                        .headers()
+                        .get(header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        == Some(expected.as_str())
+                    || response.status().as_u16() == 200 && offset == 0 && length as u64 == n.size,
+                "Google ignored the requested range; full download was refused"
+            );
+            let next_tag = response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .filter(|tag| !tag.starts_with("W/"))
+                .map(str::to_owned);
+            if let Some(tag) = &tag {
+                anyhow::ensure!(
+                    next_tag.as_ref() == Some(tag),
+                    "Remote file changed during read"
+                );
+            }
+            let mut bytes = Vec::with_capacity(length);
+            response.take(length as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() != length {
+                return Err(IncompleteRange.into());
+            }
+            if tag.is_none() {
+                let current = self.get(&n.id)?.context("Remote file was removed")?;
+                anyhow::ensure!(
+                    current.same_content(n),
+                    "Remote file changed; close and reopen it"
+                );
+                if !content_revision && let Some(tag) = next_tag {
+                    let mut tags = self.range_tags.lock();
+                    if tags.len() >= 256 {
+                        tags.clear();
+                    }
+                    tags.insert(key, tag);
                 }
-                tags.insert(key, tag);
+            }
+            Ok(bytes)
+        };
+        let started = std::time::Instant::now();
+        for attempt in 0..3 {
+            let result = (|| -> Result<Vec<u8>> {
+                if attempt == 0 || length <= self.range_window.load(Ordering::Relaxed) {
+                    return read(offset, length);
+                }
+                // Retry slow/broken wide responses in smaller pieces, entirely in RAM.
+                let target = (n.size - offset).min(length as u64) as usize;
+                let mut bytes = Vec::with_capacity(target);
+                while bytes.len() < target {
+                    anyhow::ensure!(
+                        started.elapsed() < Duration::from_secs(90),
+                        "Cloud read retry budget exhausted; close and retry the copy"
+                    );
+                    bytes.extend(read(
+                        offset + bytes.len() as u64,
+                        (target - bytes.len()).min(crate::streaming::BLOCK),
+                    )?);
+                }
+                Ok(bytes)
+            })();
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if attempt < 2 && retryable_read(&error) => {
+                    if length > crate::streaming::BLOCK
+                        && !error.chain().any(|cause| cause.is::<DriveHttpError>())
+                    {
+                        self.range_window
+                            .store(crate::streaming::BLOCK, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(250 << attempt));
+                }
+                Err(error) => return Err(error),
             }
         }
-        Ok(bytes)
+        unreachable!()
     }
     fn upload_source(
         &self,
@@ -577,12 +703,19 @@ mod tests {
                     bytes.extend_from_slice(&block[..count]);
                 }
                 captured.lock().push((headers, bytes[boundary..].to_vec()));
+                let declared = response
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+                    .map(|(_, v)| v.parse::<usize>().unwrap())
+                    .unwrap_or(response.body.len());
                 let extra = response
                     .headers
                     .iter()
+                    .filter(|(k, _)| !k.eq_ignore_ascii_case("Content-Length"))
                     .map(|(k, v)| format!("{k}: {v}\r\n"))
                     .collect::<String>();
-                write!(stream,"HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n{}\r\n{}",response.status,response.body.len(),extra,response.body).unwrap();
+                write!(stream,"HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n{}\r\n{}",response.status,declared,extra,response.body).unwrap();
             }
         });
         (origin, requests, thread)
@@ -749,5 +882,180 @@ mod tests {
         );
         thread.join().unwrap();
         assert!(drive.range_tags.lock().is_empty());
+    }
+
+    #[test]
+    fn video_metadata_version_changes_do_not_interrupt_content_reads() {
+        let mut initial = file();
+        initial["headRevisionId"] = json!("blob-1");
+        let mut metadata = initial.clone();
+        metadata["version"] = json!("13");
+        let (origin, requests, thread) = server(vec![
+            Fixture {
+                status: 206,
+                headers: vec![
+                    ("Content-Range", "bytes 0-3/100".into()),
+                    ("ETag", "\"metadata-12\"".into()),
+                ],
+                body: "abcd".into(),
+            },
+            fixture(200, metadata.clone()),
+            Fixture {
+                status: 206,
+                headers: vec![
+                    ("Content-Range", "bytes 4-7/100".into()),
+                    ("ETag", "\"metadata-13\"".into()),
+                ],
+                body: "efgh".into(),
+            },
+            fixture(200, metadata),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let drive = client(root.path(), &origin);
+        let n = node(initial).unwrap();
+        assert_eq!(drive.read_range(&n, 0, 4).unwrap(), b"abcd");
+        assert_eq!(drive.read_range(&n, 4, 4).unwrap(), b"efgh");
+        thread.join().unwrap();
+        assert!(
+            !requests
+                .lock()
+                .iter()
+                .any(|r| r.0.to_lowercase().contains("if-match:"))
+        );
+    }
+
+    #[test]
+    fn blob_revision_changes_are_still_refused_before_caching_bytes() {
+        let mut original = file();
+        original["headRevisionId"] = json!("blob-1");
+        let mut changed = original.clone();
+        changed["headRevisionId"] = json!("blob-2");
+        let (origin, _, thread) = server(vec![
+            Fixture {
+                status: 206,
+                headers: vec![("Content-Range", "bytes 0-3/100".into())],
+                body: "abcd".into(),
+            },
+            fixture(200, changed),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let drive = client(root.path(), &origin);
+        assert!(
+            drive
+                .read_range(&node(original).unwrap(), 0, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn transient_range_failure_retries_the_same_offsets() {
+        let (origin, requests, thread) = server(vec![
+            fixture(503, json!({})),
+            fixture(429, json!({})),
+            Fixture {
+                status: 206,
+                headers: vec![("Content-Range", "bytes 4-7/100".into())],
+                body: "efgh".into(),
+            },
+            fixture(200, file()),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let drive = client(root.path(), &origin);
+        assert_eq!(
+            drive.read_range(&node(file()).unwrap(), 4, 4).unwrap(),
+            b"efgh"
+        );
+        thread.join().unwrap();
+        assert!(
+            requests.lock()[..3]
+                .iter()
+                .all(|r| r.0.to_lowercase().contains("range: bytes=4-7"))
+        );
+    }
+
+    #[test]
+    fn retry_exhaustion_is_bounded_and_permission_failures_are_not_retried() {
+        for (status, count) in [(503, 3), (403, 1)] {
+            let (origin, requests, thread) =
+                server((0..count).map(|_| fixture(status, json!({}))).collect());
+            let root = tempfile::tempdir().unwrap();
+            let drive = client(root.path(), &origin);
+            assert!(drive.read_range(&node(file()).unwrap(), 0, 4).is_err());
+            thread.join().unwrap();
+            assert_eq!(requests.lock().len(), count);
+        }
+    }
+
+    #[test]
+    fn disconnected_range_body_is_retried_without_returning_partial_bytes() {
+        let (origin, requests, thread) = server(vec![
+            Fixture {
+                status: 206,
+                headers: vec![
+                    ("Content-Range", "bytes 0-3/100".into()),
+                    ("Content-Length", "4".into()),
+                ],
+                body: "ab".into(),
+            },
+            Fixture {
+                status: 206,
+                headers: vec![("Content-Range", "bytes 0-3/100".into())],
+                body: "abcd".into(),
+            },
+            fixture(200, file()),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let drive = client(root.path(), &origin);
+        assert_eq!(
+            drive.read_range(&node(file()).unwrap(), 0, 4).unwrap(),
+            b"abcd"
+        );
+        thread.join().unwrap();
+        assert_eq!(requests.lock().len(), 3);
+    }
+
+    #[test]
+    fn interrupted_wide_range_falls_back_to_small_chunks_for_slow_connections() {
+        let block = crate::streaming::BLOCK;
+        let size = 2 * block;
+        let mut metadata = file();
+        metadata["size"] = json!(size.to_string());
+        metadata["headRevisionId"] = json!("blob-1");
+        let (origin, requests, thread) = server(vec![
+            Fixture {
+                status: 206,
+                headers: vec![
+                    ("Content-Range", format!("bytes 0-{}/{}", size - 1, size)),
+                    ("Content-Length", size.to_string()),
+                ],
+                body: "ab".into(),
+            },
+            Fixture {
+                status: 206,
+                headers: vec![("Content-Range", format!("bytes 0-{}/{}", block - 1, size))],
+                body: "a".repeat(block),
+            },
+            fixture(200, metadata.clone()),
+            Fixture {
+                status: 206,
+                headers: vec![(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", block, size - 1, size),
+                )],
+                body: "b".repeat(block),
+            },
+            fixture(200, metadata.clone()),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let drive = client(root.path(), &origin);
+        let bytes = drive.read_range(&node(metadata).unwrap(), 0, size).unwrap();
+        assert_eq!(&bytes[..block], vec![b'a'; block]);
+        assert_eq!(&bytes[block..], vec![b'b'; block]);
+        assert_eq!(drive.sequential_range_size(), block);
+        thread.join().unwrap();
+        assert_eq!(requests.lock().len(), 5);
     }
 }
