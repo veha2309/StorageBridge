@@ -9,5 +9,6 @@ pub mod platform;
 #[path = "platform/macos/mod.rs"]
 pub mod platform;
 pub mod runtime;
+pub mod storage;
 pub mod store;
 pub mod streaming;

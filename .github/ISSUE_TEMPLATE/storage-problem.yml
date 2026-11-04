@@ -1,0 +1,33 @@
+name: Storage or transfer problem
+description: Report a quota, upload, cache, or filesystem problem using redacted details.
+title: "[Storage] "
+body:
+  - type: markdown
+    attributes:
+      value: "Keep pending data intact. Do not attach OAuth client JSON, tokens, file contents, or the metadata database. The app's Copy storage report action excludes filenames and account details."
+  - type: input
+    id: platform
+    attributes:
+      label: OS and app version
+      placeholder: "Windows 11, Storage Bridge 0.4.0"
+    validations:
+      required: true
+  - type: textarea
+    id: operation
+    attributes:
+      label: Operation and reproduction steps
+      description: "Describe the action, connectivity, and error. Redact private filenames."
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Aggregate storage report
+      description: "Paste Overview → Copy storage report. Review it before submitting."
+      render: json
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true

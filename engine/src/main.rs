@@ -242,6 +242,17 @@ fn run() -> Result<()> {
                     Ok(json!({}))
                 }
                 "settings" => {
+                    if let Some(value) = p.get("content_limit") {
+                        let limit = value
+                            .as_u64()
+                            .context("Local content limit must be an integer number of bytes")?;
+                        ensure!(
+                            (64 * 1024 * 1024..=storage_bridge::storage::MAX_CONTENT_LIMIT)
+                                .contains(&limit),
+                            "Local content limit must be between 64 MiB and 16 TiB"
+                        );
+                        engine.lock().set_content_limit(limit)?;
+                    }
                     if let Some(value) = p.get("online_only") {
                         engine.lock().set_online_only(
                             value
@@ -271,6 +282,10 @@ fn run() -> Result<()> {
                             .store
                             .set("startup", if enabled { "true" } else { "false" })?;
                     }
+                    Ok(json!({}))
+                }
+                "release_cache" => {
+                    engine.lock().release_clean_content()?;
                     Ok(json!({}))
                 }
                 "retry" => {

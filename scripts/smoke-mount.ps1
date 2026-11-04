@@ -58,6 +58,33 @@ try {
         if ($expected -ne $actual) { throw 'Large-file checksum mismatch' }
     } finally { $sha.Dispose() }
     if ((Invoke-TestBridge status).cache_bytes -ne 0) { throw 'Streaming reads created a disk copy' }
+    # Exercise the hard allowance through real WinFsp callbacks, including ENOSPC mapping.
+    Invoke-TestBridge settings @{content_limit = 64 * 1024 * 1024} | Out-Null
+    $bounded = Join-Path $folder 'bounded.bin'
+    $boundedStream = [System.IO.FileStream]::new($bounded, [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 1, [System.IO.FileOptions]::WriteThrough)
+    try {
+        $boundedStream.SetLength(64 * 1024 * 1024)
+        $boundedStream.WriteByte(90)
+        $boundedStream.Position = 64 * 1024 * 1024
+        $rejected = $false
+        try { $boundedStream.WriteByte(1); $boundedStream.Flush() } catch {
+            $code = $_.Exception.GetBaseException().HResult -band 0xFFFF
+            if ($code -notin @(112,39)) { throw }
+            $rejected = $true
+        }
+        if (-not $rejected) { throw 'Write beyond content allowance was accepted' }
+        $usage = (Invoke-TestBridge status).storage
+        if ($usage.used_bytes -ne (64 * 1024 * 1024) -or -not $usage.write_blocked) {
+            throw 'Content allowance counters are incorrect after rejected write'
+        }
+        Invoke-TestBridge release_cache | Out-Null
+        $boundedStream.Position = 0
+        if ($boundedStream.ReadByte() -ne 90) { throw 'Accepted data was lost after quota rejection/cleanup' }
+    } finally { $boundedStream.Dispose() }
+    Wait-TestUploads
+    if ((Invoke-TestBridge status).storage.write_blocked) { throw 'Allowance did not recover after upload cleanup' }
+    [System.IO.File]::Delete($bounded)
     [System.IO.File]::Delete($large)
     $empty = Join-Path $folder 'empty.txt'
     [System.IO.File]::WriteAllBytes($empty, [byte[]]@())
@@ -73,8 +100,18 @@ try {
     Invoke-TestBridge unmount | Out-Null
     Wait-TestUploads
     Invoke-TestBridge shutdown | Out-Null
-    'PASS: network drive streaming, partial edits, 17 MiB checksum, zero read-cache disk bytes, replace/rename/delete/unmount'
+    'PASS: streaming, partial edits, 17 MiB checksum, zero read disk cache, enforced 64 MiB allowance/disk-full rejection/recovery, replace/rename/delete/unmount'
 } finally {
     try { Invoke-TestBridge unmount | Out-Null; Invoke-TestBridge shutdown | Out-Null } catch {}
     if (-not $process.HasExited) { $process.WaitForExit(3000) | Out-Null }
+    if ($process.HasExited) {
+        # Remove only this run's private demo remote after its daemon has stopped.
+        $dataRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'StorageBridge\StorageBridge\data'))
+        $demoRoot = [System.IO.Path]::GetFullPath((Join-Path $dataRoot "demo-$instance"))
+        if ((Split-Path -Parent $demoRoot) -ne $dataRoot -or
+            (Split-Path -Leaf $demoRoot) -ne "demo-$instance" -or $instance -notmatch '^[a-f0-9]{32}$') {
+            throw 'Refusing to clean an unexpected demo directory'
+        }
+        if (Test-Path -LiteralPath $demoRoot) { Remove-Item -LiteralPath $demoRoot -Recurse -Force }
+    }
 }

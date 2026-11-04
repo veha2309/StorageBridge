@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ENGINE="${1:-target/debug/storage-bridge}"
 python3 - "$ENGINE" <<'PY'
-import ctypes, hashlib, json, os, pathlib, subprocess, sys, time, uuid
+import ctypes, errno, hashlib, json, os, pathlib, subprocess, sys, time, uuid
 engine = str(pathlib.Path(sys.argv[1]).resolve())
 instance = uuid.uuid4().hex
 args = [engine, '--demo', '--test-instance', instance]
@@ -65,6 +65,26 @@ try:
     renamed = folder / 'renamed.bin'
     file.rename(renamed)
     assert renamed.name in os.listdir(folder)
+    request('settings', {'content_limit': 64 * 1024 * 1024})
+    bounded = folder / 'bounded.bin'
+    with bounded.open('w+b', buffering=0) as stream:
+        stream.truncate(64 * 1024 * 1024)
+        stream.write(b'Z')
+        stream.seek(64 * 1024 * 1024)
+        try:
+            stream.write(b'!')
+        except OSError as error:
+            assert error.errno == errno.ENOSPC, error
+        else:
+            raise AssertionError('Write beyond content allowance was accepted')
+        usage = request('status')['storage']
+        assert usage['used_bytes'] == 64 * 1024 * 1024 and usage['write_blocked'], usage
+        request('release_cache')
+        stream.seek(0)
+        assert stream.read(1) == b'Z', 'Accepted bytes lost after rejected write'
+    wait_for(lambda: request('status')['pending'] == 0 and request('status')['cache_bytes'] == 0)
+    assert not request('status')['storage']['write_blocked']
+    bounded.unlink()
     renamed.unlink()
     folder.rmdir()
     wait_for(lambda: request('status')['pending'] == 0)
@@ -73,7 +93,7 @@ try:
     request('shutdown')
     process.wait(timeout=10)
     assert process.returncode == 0
-    print('PASS: mounted demo create/read/stream/partial write/replace/rename/delete/unmount')
+    print('PASS: mounted demo operations, enforced content allowance, ENOSPC preservation/recovery, unmount')
 finally:
     if process.poll() is None:
         try:

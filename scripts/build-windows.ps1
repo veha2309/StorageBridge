@@ -35,12 +35,12 @@ try {
     $bundle = Join-Path $workspace "release\$BundleName"
     New-Item -ItemType Directory -Force -Path $bundle | Out-Null
     Copy-Item -Path 'desktop\build\windows\x64\runner\Release\*' -Destination $bundle -Recurse -Force
-    Copy-Item -LiteralPath 'target\release\storage-bridge.exe','README.md','LICENSE','THIRD_PARTY_NOTICES.md' -Destination $bundle -Force
-    $runtimeRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC'
-    if (Test-Path -LiteralPath $runtimeRoot) {
-        $runtime = Get-ChildItem -Path "$runtimeRoot\*\x64\Microsoft.VC143.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
-        if ($runtime) { Copy-Item -Path "$($runtime.FullName)\*.dll" -Destination $bundle -Force }
-    }
+    Copy-Item -LiteralPath 'target\release\storage-bridge.exe','README.md','LICENSE','THIRD_PARTY_NOTICES.md','PRODUCT.md','SUPPORT.md','PLATFORMS.md','VALIDATION.md' -Destination $bundle -Force
+    $runtimeRoots = @(Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022\*\VC\Redist\MSVC' -Directory -ErrorAction SilentlyContinue)
+    $runtime = $runtimeRoots | ForEach-Object {
+        Get-ChildItem -Path "$($_.FullName)\*\x64\Microsoft.VC143.CRT" -Directory -ErrorAction SilentlyContinue
+    } | Sort-Object FullName -Descending | Select-Object -First 1
+    if ($runtime) { Copy-Item -Path "$($runtime.FullName)\*.dll" -Destination $bundle -Force }
     Compress-Archive -LiteralPath $bundle -DestinationPath "release\$BundleName-windows-x64.zip" -Force
     if ($Installer) {
         $compiler = Get-Command iscc -ErrorAction SilentlyContinue

@@ -72,6 +72,11 @@ impl Remote for Gate {
         }
         self.inner.download(id, p)
     }
+    fn read_range(&self, n: &Node, offset: u64, length: usize) -> Result<Vec<u8>> {
+        self.check()?;
+        ensure!(!self.partial.load(Ordering::SeqCst), "Interrupted download");
+        self.inner.read_range(n, offset, length)
+    }
     fn upload(&self, n: &Node, p: &Path, exists: bool) -> Result<Node> {
         self.check()?;
         self.inner.upload(n, p, exists)

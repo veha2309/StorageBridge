@@ -1,0 +1,41 @@
+name: macOS native acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      dedicated_runner:
+        description: Confirm this is a dedicated Mac test account with macFUSE approved and no personal mount
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never execute fork PR code automatically on a self-hosted runner.
+concurrency:
+  group: storagebridge-native-mac
+  cancel-in-progress: false
+
+jobs:
+  native:
+    name: Finder and macFUSE mounted-drive acceptance
+    if: inputs.dedicated_runner
+    runs-on: [self-hosted, macOS, storagebridge-fuse]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check required driver and toolchains
+        shell: bash
+        run: |
+          test -e /usr/local/lib/libfuse3.dylib
+          cargo --version
+          flutter --version
+      - name: Build and run Rust and Flutter checks
+        shell: bash
+        run: bash scripts/build-macos.sh
+      - name: Exercise Finder and the actual mounted filesystem
+        shell: bash
+        run: bash scripts/smoke-mount-macos.sh release/StorageBridge.app/Contents/MacOS/storage-bridge

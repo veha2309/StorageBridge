@@ -1,10 +1,12 @@
 # Storage Bridge
 
-**Use Google Drive as a Windows or macOS drive with on-demand streaming reads and durable background writes.**
+**Your cloud. Your local storage budget.**
+
+Use Google Drive as a drive with streaming reads, durable background writes, and an enforced allowance for local file content. Open cloud files larger than your allowance without creating full read copies on disk. See exactly which pending writes and retained copies use local space.
 
 Storage Bridge is a Windows-first personal cloud-drive preview built with Flutter/Dart, Rust, SQLite, and WinFsp. Mount **My Drive/StorageBridge** as a drive letter (default `G:`), browse in File Explorer, and open or edit files with normal Windows applications. The custom engine talks directly to Google Drive; it needs no rclone installation or hosted backend.
 
-**Current version: 0.3.0. Windows x64, with a new macOS adapter.** macOS uses macFUSE, Keychain, a Unix socket, and a native menu bar bridge. Live macOS mounting and Google sign-in still require validation. This is an experimental filesystem preview, not a claim of production-ready or simultaneous multi-device editing support.
+**Current version: 0.4.0. Windows x64 validated; macOS adapter implemented but unverified here.** macOS uses macFUSE, Keychain, a Unix socket, and a native menu bar bridge. Live macOS mounting and Google sign-in still require validation. This is an experimental filesystem preview, not a claim of production-ready or simultaneous multi-device editing support. See [platform assessment](PLATFORMS.md).
 
 ## Features
 
@@ -14,6 +16,7 @@ Storage Bridge is a Windows-first personal cloud-drive preview built with Flutte
 - Durable local staging for new content and changed-byte journals for edits to uncached files.
 - Resumable uploads, persisted pending operations, retries, remote change polling, and explicit upload errors.
 - Online-only cleanup, adjustable retained-file cache budget, and separate RAM/disk usage counters.
+- Enforced local content allowance (default **1 GiB**), per-file space explanations, safe cleanup, and a copyable storage report that excludes filenames and account details.
 - Tray controls, optional startup reconnect, account/storage summary, transfer progress, and Windows installer tooling.
 
 ## Architecture
@@ -39,7 +42,7 @@ The engine continues running when the UI closes to the tray. Network reads, uplo
 
 ## Run on Windows
 
-Build the project using the instructions below, then open `release/StorageBridge/storage_bridge.exe` or install `release/StorageBridge-Setup-0.3.0-x64.exe`. Compiled applications, installers, and toolchains are excluded from Git. WinFsp must be installed to mount a drive; the app checks for it. Build targets Windows x64.
+Build the project using the instructions below, then open `release/StorageBridge/storage_bridge.exe` or install `release/StorageBridge-Setup-0.4.0-x64.exe`. Compiled applications, installers, and toolchains are excluded from Git. WinFsp must be installed to mount a drive; the app checks for it. Build targets Windows x64.
 
 1. Click **Start engine**, then **Import OAuth client**.
 2. Import your downloaded Google **Desktop app** OAuth client JSON.
@@ -53,7 +56,19 @@ To test without Google credentials, click **Try local test drive** before starti
 
 Closing the window hides it to the tray. Double-click the tray icon to reopen it. Quitting the desktop UI leaves the engine running. **Settings → Stop background engine** requires closed file handles and an empty upload queue. Startup reconnect is opt-in and runs at user sign-in, without administrator privileges.
 
-## Streaming reads and hybrid writes (0.3.0)
+## Local storage control (0.4.0)
+
+**Settings → Local content limit** controls a hard allowance for the sum of managed content-file lengths, including new files, changed-byte journals, retained complete copies, and temporary legacy downloads. The default is 1 GiB; the UI accepts 64 MiB–16 TiB. It applies in both online-only and retained-cache modes, across all files together. Growth checks and disk writes share a lock, including conflict-copy duplication by background workers.
+
+Before accepting growth, the engine removes eligible clean, closed copies to make room. If protected content still leaves too little space, it returns a disk-full error to the writing application **before that write request changes content or pending intent**. Earlier successful requests remain staged. A multi-request copy can therefore leave an accepted partial destination when a later request fails. Keep the source and retry after making room. Existing edits are never deleted to satisfy the allowance.
+
+The Overview shows pending, retained, and recovery bytes, with **Why space is used** listing up to 100 files (totals cover every file). **Free completed copies** removes only eligible clean copies. **Copy storage report** copies an aggregate report without filenames, account details, OAuth credentials, or tokens. See [support guide](SUPPORT.md).
+
+Lowering the limit below protected content is refused. Older installations may already have more pending content than the new default; recovery preserves it, reports the excess, and blocks additional growth until uploads or cleanup free space. In-place overwrites that require no growth remain possible. Partial journals are append-only until upload, so repeated changes can use more journal bytes than the final changed region.
+
+This allowance measures logical content-file lengths, conservatively including sparse-file lengths. It is not an exact physical disk-allocation cap: filesystem clusters/metadata, SQLite, credentials, binaries, paging, and other applications are outside it. Pending uploads wait for writable handles to close. Creating or replacing a new file larger than the allowance requires raising the allowance; arbitrary large writes are not promised with zero staging.
+
+## Streaming reads and hybrid writes
 
 Reads from uncached files now use HTTP byte ranges and a **32 MiB RAM cache**, in **1 MiB blocks**, with at most four simultaneous range fetches. Reading or seeking does not create a full local file. Known folder listings are returned from SQLite immediately, with stale metadata refreshed in the background. WinFsp uses asynchronous callbacks and a separate directory queue; uploads and change polling run independently without holding the metadata mutex during network calls. The mount is reported as a network drive and files are marked as not content-indexed.
 
@@ -81,6 +96,8 @@ External OAuth apps in Testing have seven-day authorizations/refresh tokens for 
 The cache is bound to one Google account. Reauthorization with a different account is rejected. Account switching and multiple accounts are not implemented.
 
 ## Build and test
+
+GitHub Actions runs checks for every push and pull request, including Windows x64 and macOS Apple Silicon/Intel builds, Rust/Flutter tests, formatting/lint, and real Windows mount/installer smoke tests. The stable **Required checks** gate combines every hosted job. Native Mac mounting is a separate manual acceptance workflow on a dedicated Mac. See [CI configuration and branch-protection setup](.github/CI.md).
 
 Prerequisites:
 
@@ -114,7 +131,7 @@ Default build outputs:
 | --- | --- |
 | Portable application and engine | `release/StorageBridge/` |
 | Portable ZIP | `release/StorageBridge-windows-x64.zip` |
-| Windows installer | `release/StorageBridge-Setup-0.3.0-x64.exe` |
+| Windows installer | `release/StorageBridge-Setup-0.4.0-x64.exe` |
 
 Individual checks, after installing prerequisites and configuring `LIBCLANG_PATH`:
 
@@ -139,7 +156,7 @@ Run the actual filesystem test with an unused drive letter (the test uses an iso
 
 It uses only the disk-backed demo remote and exercises create/read/write, streamed reads after eviction, partial edits, a 17 MiB checksum check, temporary-file replacement, rename, listing, deletion, and unmount. It never runs against a Google account. `engine/tests/recovery.rs` covers crash recovery, cache retention, remote changes, conflicts, moves, and replacement ordering. HTTP fixtures exercise Google pagination, quota errors, and resumed upload offsets.
 
-Version 0.3.0 has passed 48 Rust tests, two Flutter widget tests, static analysis, Clippy, actual WinFsp mounted-drive tests, and limited live Google streamed read/write verification. These are recorded results from the development machine, not a substitute for running tests on your own Windows setup. See [VALIDATION.md](VALIDATION.md) for the evidence and remaining manual validation.
+The 0.4.0 checks cover 55 Rust tests and three Flutter widget tests, including storage rejection, restart recovery, concurrent writes, and report privacy. The mounted Windows smoke test includes a 64 MiB allowance, actual disk-full error mapping, accepted-content preservation, and recovery after upload cleanup. Limited live Google read/write verification was previously completed on 0.3.0; the new quota tests use an isolated local remote. See [VALIDATION.md](VALIDATION.md) for recorded evidence and remaining manual validation.
 
 ## macOS build and run
 
@@ -175,7 +192,7 @@ Rust tests and Flutter checks can run without activating the macFUSE extension, 
 
 - Browsing uses metadata only. Uncached reads stream requested ranges into RAM. Pending edits and retained complete local writes can be read offline; other reads require internet unless their ranges happen to remain in RAM. New files/folders require a connection to reserve a Drive ID.
 - Writes are journaled before modification and flushed locally before acknowledgement. Uploads wait until file handles close. SQLite retains pending work across crashes; resumable session URLs and credentials use Windows DPAPI.
-- Default cache budget is **10 GiB**. Clean, closed files are evicted in least-recently-used order. Dirty/open files can temporarily exceed the budget; disk-full errors are returned to the writing application.
+- The optional retained-clean-cache target defaults to **10 GiB** and is bounded by the separate **1 GiB** default content allowance. The retention target is a cleanup preference; the content allowance checks growth before writes. Dirty/open files are protected, and writes requiring space beyond the allowance are refused.
 - Remote changes are polled every 30 seconds. When full local content exists, a version change detected before upload preserves a separate conflict copy. When only a partial journal exists, conflicting uploads stop and retain the journal for manual recovery. There is no distributed lock or guarantee against edits occurring after that check. Use one device at a time and wait for uploads before switching.
 - Renames preserve Drive IDs. Replacing a destination stages the new version first, then trashes the replaced remote file. Deleting an item moves it to Google Drive Trash; nonempty directories must have their contents removed first.
 - Remote duplicate, reserved, case-colliding, or invalid Windows names receive stable persisted aliases. Aliasing alone never renames remote files.
@@ -187,7 +204,7 @@ Live Google sign-in and a limited mounted read/write path have been verified dur
 
 Explorer shows the cloud file's logical size and an allocation value supplied by the virtual filesystem. **The mounted drive's “Size on disk” field does not measure the content cache on C:.**
 
-The app separately reports **Temporary local storage** (disk staging) and **Read buffer (RAM)**. A full 32 MiB read buffer replaces older blocks as new ones arrive; it does not grow into a full local copy of a large video. Inspect this real local directory to verify content staging:
+The app separately reports **Your local storage budget** (managed content) and **Read buffer (RAM)**. A full 32 MiB read buffer replaces older blocks as new ones arrive; it does not grow into a full local copy of a large video. Inspect this real local directory to verify content staging:
 
 ```text
 %LOCALAPPDATA%\StorageBridge\StorageBridge\data\google\cache
@@ -206,8 +223,9 @@ With online-only cleanup enabled, no pending writes, and no retained legacy cont
 | Partial-edit conflict | Preserve the data directory and journal; manual recovery is required. Do not delete staging to clear an error. |
 | Cannot stop or unmount | Close open drive files and allow pending uploads to finish. The engine protects active work. |
 | Build cannot locate libclang | Point `LIBCLANG_PATH` at the directory containing `libclang.dll`. |
+| Disk-full error despite free space on C: | Check the local content allowance in Overview. Close handles, wait for uploads, free completed copies, or raise the allowance before retrying. |
 
-The cache budget is not a hard ceiling for unsent work. Dirty or open files are protected, so pending writes may exceed the configured budget. A locally saved file is not yet confirmed in Google Drive until its upload completes.
+The retention target and enforced content allowance are separate controls. A locally saved file is not yet confirmed in Google Drive until its upload completes. See [product direction](PRODUCT.md) for the intended customer, positioning, and support model.
 
 ## Source layout and IPC
 
@@ -225,7 +243,7 @@ The engine's per-user named pipe is `\\.\pipe\StorageBridge-v1-<Windows SID>`. I
 {"version":1,"method":"mount","params":{"letter":"G:"}}
 ```
 
-Responses contain `version`, `ok`, and either `result` or `error`. Methods are `status`, `configure`, `login`, `mount`, `unmount`, `settings`, `retry`, and `shutdown`. Status includes queued transfers, active byte progress, cache usage, account/quota metadata, mount state, and recent events. Flutter polls status every two seconds; remote changes are independently polled by the engine.
+Responses contain `version`, `ok`, and either `result` or `error`. Methods are `status`, `configure`, `login`, `mount`, `unmount`, `settings`, `release_cache`, `retry`, and `shutdown`. Status includes queued transfers, active byte progress, cache usage, account/quota metadata, mount state, and recent events. `settings.content_limit` accepts an integer byte allowance. `status.storage` contains allowance, used/available bytes, pending/retained/recovery totals, blocked/over-limit flags, and a bounded per-file explanation. Flutter polls status every two seconds; remote changes are independently polled by the engine.
 
 Diagnostics from PowerShell:
 

@@ -317,6 +317,9 @@ impl Runtime {
         let end = start
             .checked_add(count as u64)
             .context("File offset overflow")?;
+        let writes = e.content_writes.clone();
+        let _content_guard = writes.lock();
+        e.check_content_growth(count as u64, Some(id))?;
         let mut file = std::fs::OpenOptions::new().append(true).open(e.cache(id))?;
         let stored = file.seek(SeekFrom::End(0))?;
         file.write_all(&bytes[..count])?;

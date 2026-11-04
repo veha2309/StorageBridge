@@ -95,6 +95,9 @@ struct BridgeFs {
     next: u64,
 }
 fn errno(error: anyhow::Error) -> i32 {
+    if error.is::<crate::storage::ContentLimitExceeded>() {
+        return libc::ENOSPC;
+    }
     let text = error.to_string().to_lowercase();
     if let Some(io) = error.downcast_ref::<std::io::Error>() {
         return io.raw_os_error().unwrap_or(libc::EIO);

@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep every pushed revision's run; only superseded PR runs are cancelled.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  FLUTTER_VERSION: '3.47.5'
+
+jobs:
+  workflow-checks:
+    name: Workflow and repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Validate workflows with actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color
+      - name: Check shell syntax
+        run: |
+          for script in scripts/build-macos.sh scripts/smoke-mount-macos.sh .github/scripts/setup-macos.sh; do
+            bash -n "$script"
+          done
+      - name: Check application version consistency
+        run: python3 .github/scripts/check-versions.py
+
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-2022
+            platform: windows
+            arch: x64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            platform: macos
+            arch: arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            platform: macos
+            arch: x64
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.runner }}-${{ matrix.arch }}
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: ${{ matrix.arch }}
+          cache: true
+      - name: Install Windows test prerequisites
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./.github/scripts/setup-windows.ps1
+      - name: Install macOS build SDK
+        if: matrix.platform == 'macos'
+        run: bash .github/scripts/setup-macos.sh
+      - name: Validate PowerShell syntax
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem scripts,.github/scripts -Filter '*.ps1' -File -Recurse)
+          foreach ($file in $files) {
+            $parseErrors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          }
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust tests including recovery, quotas, and platform IPC
+        run: |
+          mkdir -p test-results
+          cargo test --locked 2>&1 | tee test-results/rust-tests.log
+      - name: Rust lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Flutter checks on Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          flutter pub get --enforce-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dart format --output=none --set-exit-if-changed lib test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          flutter analyze --fatal-infos
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          flutter test --coverage --reporter expanded
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Flutter checks on macOS
+        if: matrix.platform == 'macos'
+        working-directory: desktop
+        run: |
+          flutter pub get --enforce-lockfile
+          dart format --output=none --set-exit-if-changed lib test
+          flutter analyze --fatal-infos
+          flutter test --coverage --reporter expanded
+      - name: Build Windows portable app and installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -SkipTests -Installer
+      - name: Windows mounted-drive and storage-limit smoke test
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./scripts/smoke-mount.ps1 -Engine ./release/StorageBridge/storage-bridge.exe
+      - name: Windows install and uninstall smoke test
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./scripts/test-installer.ps1
+      - name: Build macOS app and engine
+        if: matrix.platform == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
+        run: bash scripts/build-macos.sh --skip-tests
+      - name: Save test logs and coverage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-results-${{ matrix.runner }}-${{ matrix.arch }}
+          path: |
+            test-results/
+            desktop/coverage/lcov.info
+            release/installer-smoke.log
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Save Windows build
+        if: success() && matrix.platform == 'windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-x64-${{ github.sha }}
+          path: |
+            release/StorageBridge-windows-x64.zip
+            release/StorageBridge-Setup-*-x64.exe
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+      - name: Save macOS build
+        if: success() && matrix.platform == 'macos'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: macos-${{ matrix.arch }}-${{ github.sha }}
+          path: release/StorageBridge-macos-*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  required-checks:
+    name: Required checks
+    if: always()
+    needs: [workflow-checks, desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every check and platform to pass
+        env:
+          WORKFLOW_RESULT: ${{ needs.workflow-checks.result }}
+          DESKTOP_RESULT: ${{ needs.desktop.result }}
+        run: |
+          if [[ "$WORKFLOW_RESULT" != success || "$DESKTOP_RESULT" != success ]]; then
+            echo "Required checks failed: workflows=$WORKFLOW_RESULT desktop=$DESKTOP_RESULT"
+            exit 1
+          fi

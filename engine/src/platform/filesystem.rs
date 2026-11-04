@@ -44,6 +44,9 @@ pub struct Handle {
     delete: AtomicBool,
 }
 fn error(e: anyhow::Error) -> winfsp::FspError {
+    if e.is::<crate::storage::ContentLimitExceeded>() {
+        return STATUS_DISK_FULL.into();
+    }
     let text = e.to_string();
     if let Some(io) = e.downcast_ref::<std::io::Error>()
         && io.raw_os_error() == Some(112)
@@ -284,7 +287,7 @@ impl FileSystemContext for BridgeFs {
         if let Ok(lock) = h.dir.acquire(marker.is_none(), None) {
             let nodes = self.runtime.list(&h.id).map_err(error)?;
             let e = self.engine.lock();
-            if h.id != e.root_id() {
+            if h.id != e.root_id().map_err(error)? {
                 let n = e.store.get(&h.id).map_err(error)?;
                 for (name, id) in [(".", n.id), ("..", n.parent)] {
                     let mut entry = DirInfo::<255>::new();

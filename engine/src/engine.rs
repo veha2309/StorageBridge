@@ -30,6 +30,7 @@ pub struct Engine {
     pub(crate) metadata_only: bool,
     pub read_cache: Arc<crate::streaming::ReadCache>,
     pub(crate) read_views: HashMap<String, Node>,
+    pub(crate) content_writes: Arc<parking_lot::Mutex<()>>,
 }
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -48,6 +49,7 @@ impl Engine {
             metadata_only: false,
             read_cache: Arc::new(crate::streaming::ReadCache::default()),
             read_views: HashMap::new(),
+            content_writes: Arc::new(parking_lot::Mutex::new(())),
         };
         for mut node in engine.store.all()? {
             if node.dirty
@@ -89,6 +91,7 @@ impl Engine {
             metadata_only: false,
             read_cache: self.read_cache.clone(),
             read_views: HashMap::new(),
+            content_writes: self.content_writes.clone(),
         })
     }
     pub fn root_id(&self) -> Result<String> {
@@ -420,10 +423,26 @@ impl Engine {
             );
             let part = path.with_extension("download");
             let _partial = PartialDownload(part.clone());
-            if let Err(e) = self.remote.download(id, &part) {
-                let _ = std::fs::remove_file(&part);
-                return Err(e).context("File is not available offline; reconnect to download it");
+            let writes = self.content_writes.clone();
+            let _guard = writes.lock();
+            self.check_content_growth(n.size, Some(id))?;
+            let mut file = File::create(&part)?;
+            let mut offset = 0;
+            while offset < n.size {
+                let length = (n.size - offset).min(crate::streaming::BLOCK as u64) as usize;
+                let bytes = self
+                    .remote
+                    .read_range(&n, offset, length)
+                    .context("File is not available offline; reconnect to download it")?;
+                ensure!(
+                    bytes.len() == length,
+                    "Incomplete download; retry opening the file"
+                );
+                file.write_all(&bytes)?;
+                offset += length as u64;
             }
+            file.sync_all()?;
+            drop(file);
             ensure!(
                 std::fs::metadata(&part)?.len() == n.size,
                 "Incomplete download; retry opening the file"
@@ -468,6 +487,12 @@ impl Engine {
         if length == 0 {
             return Ok(0);
         }
+        let end = offset
+            .checked_add(length as u64)
+            .context("File offset overflow")?;
+        let writes = self.content_writes.clone();
+        let _guard = writes.lock();
+        self.check_content_growth(end.saturating_sub(n.size), Some(id))?;
         // Journal dirty state before modifying content; worker is serialized with writes.
         n.dirty = true;
         self.store.stage(&n, "reconcile")?;
@@ -484,6 +509,9 @@ impl Engine {
     }
     pub fn resize(&mut self, id: &str, size: u64) -> Result<()> {
         let mut n = self.hydrate(id)?;
+        let writes = self.content_writes.clone();
+        let _guard = writes.lock();
+        self.check_content_growth(size.saturating_sub(n.size), Some(id))?;
         n.dirty = true;
         self.store.stage(&n, "reconcile")?;
         let f = OpenOptions::new().write(true).open(self.cache(id))?;
@@ -716,6 +744,24 @@ impl Engine {
                         .map(|x| x.alias.to_lowercase())
                         .collect();
                     conflict.alias = names::alias(&conflict.name, &conflict.id, &occupied);
+                    // Detached upload workers must not evict using their open-handle snapshot.
+                    // Reserve the duplicate under the shared lock, preserving the source on failure.
+                    let writes = self.content_writes.clone();
+                    let _guard = writes.lock();
+                    let used = self.content_bytes()?;
+                    let additional = std::fs::metadata(self.cache(id))?.len();
+                    let limit = self.content_limit();
+                    if used
+                        .checked_add(additional)
+                        .is_none_or(|total| total > limit)
+                    {
+                        return Err(crate::storage::ContentLimitExceeded {
+                            used,
+                            additional,
+                            limit,
+                        }
+                        .into());
+                    }
                     std::fs::copy(self.cache(id), self.cache(&conflict.id))?;
                     OpenOptions::new()
                         .write(true)
@@ -916,6 +962,8 @@ impl Engine {
         Ok(())
     }
     pub fn evict(&mut self) -> Result<()> {
+        let writes = self.content_writes.clone();
+        let _guard = writes.lock();
         let online_only = self.online_only();
         let budget = if online_only {
             0
@@ -924,8 +972,9 @@ impl Engine {
                 .setting("cache_budget")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_BUDGET)
+                .min(self.content_limit())
         };
-        let mut nodes = self.store.all()?;
+        let nodes = self.store.all()?;
         for n in &nodes {
             if !n.cached
                 && !n.dirty
@@ -936,36 +985,7 @@ impl Engine {
                 std::fs::remove_file(self.cache(&n.id))?;
             }
         }
-        let mut total: u64 = nodes
-            .iter()
-            .filter(|n| n.cached)
-            .map(|n| {
-                std::fs::metadata(self.cache(&n.id))
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            })
-            .sum();
-        nodes.sort_by_key(|n| n.last_access);
-        for mut n in nodes {
-            if total <= budget {
-                break;
-            }
-            if n.cached
-                && !n.dirty
-                && !self.has_job(&n.id)
-                && self.open.get(&n.id).copied().unwrap_or(0) == 0
-            {
-                let size = std::fs::metadata(self.cache(&n.id))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if self.cache(&n.id).exists() {
-                    std::fs::remove_file(self.cache(&n.id))?;
-                }
-                n.cached = false;
-                self.store.put(&n)?;
-                total = total.saturating_sub(size);
-            }
-        }
+        let total = self.trim_content(budget, None)?;
         if !online_only && total > budget {
             self.last_error =
                 Some("Cache exceeds budget because files are open or awaiting upload".into());
@@ -993,22 +1013,8 @@ impl Engine {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let transfers:Vec<_>=jobs.into_iter().map(|(id,attempts,error)|json!({"id":id,"name":self.store.get(&id).map(|n|n.alias).unwrap_or(id.clone()),"state":if error.is_some(){"retrying"}else if self.open.contains_key(&id){"saved_locally"}else{"queued"},"attempts":attempts,"error":error})).collect();
-        let cache = std::fs::read_dir(self.root.join("cache"))?.try_fold(
-            0u64,
-            |total, entry| -> Result<u64> {
-                let metadata = match entry?.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(total),
-                    Err(error) => return Err(error.into()),
-                };
-                Ok(total
-                    + if metadata.is_file() {
-                        metadata.len()
-                    } else {
-                        0
-                    })
-            },
-        )?;
+        let storage = self.storage_usage()?;
+        let cache = storage.used_bytes;
         let mut stmt = self
             .store
             .db
@@ -1019,7 +1025,7 @@ impl Engine {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(
-            json!({"open_files":self.open.len(),"streaming":true,"read_cache_bytes":self.read_cache.bytes(),"read_cache_budget":crate::streaming::RAM_BUDGET,"online_only":self.online_only(),"pending":transfers.len(),"transfers":transfers,"cache_bytes":cache,"cache_budget":self.store.setting("cache_budget").and_then(|s|s.parse::<u64>().ok()).unwrap_or(DEFAULT_BUDGET),"startup":self.store.setting("startup").as_deref()==Some("true"),"drive_letter":self.store.setting("drive_letter").unwrap_or("G:".into()),"last_error":self.last_error,"about":self.store.setting("about").and_then(|s|serde_json::from_str::<Value>(&s).ok()),"events":events}),
+            json!({"open_files":self.open.len(),"streaming":true,"storage":storage,"read_cache_bytes":self.read_cache.bytes(),"read_cache_budget":crate::streaming::RAM_BUDGET,"online_only":self.online_only(),"pending":transfers.len(),"transfers":transfers,"cache_bytes":cache,"cache_budget":self.store.setting("cache_budget").and_then(|s|s.parse::<u64>().ok()).unwrap_or(DEFAULT_BUDGET),"startup":self.store.setting("startup").as_deref()==Some("true"),"drive_letter":self.store.setting("drive_letter").unwrap_or("G:".into()),"last_error":self.last_error,"about":self.store.setting("about").and_then(|s|serde_json::from_str::<Value>(&s).ok()),"events":events}),
         )
     }
 }

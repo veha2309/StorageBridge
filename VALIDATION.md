@@ -1,5 +1,23 @@
 # Windows preview validation
 
+## CI configuration — 2026-11-04
+
+- Added push/PR/merge-group workflows for Windows x64, macOS Apple Silicon, and macOS Intel, with a stable aggregate gate and a separate manual native Mac acceptance workflow.
+- actionlint 1.7.12 validated both workflow definitions locally. Python version-consistency checks, PowerShell parser checks, and Bash syntax checks passed.
+- Verified the pinned WinFsp installer's SHA-256 and valid Authenticode signature before configuring its CI prerequisite helper.
+- Installer smoke checks now derive the app version from the installer source and require a clean account. The existing personal installation was not uninstalled to exercise that CI-only path.
+- These local configuration checks do not represent completed hosted Windows/Mac CI runs. Results from GitHub Actions must be reviewed after publication; native Mac mounting remains a dedicated-runner acceptance test.
+
+## Enforced local content allowance 0.4.0 — 2026-11-04
+
+- 55 Rust tests passed (48 existing + 7 content-allowance tests). Coverage includes boundary rejection without content/intent changes, growth overflow, in-place overwrites, partial-journal restart/upload recovery, concurrent files, clean-copy eviction with open/dirty protection, refused limit reduction, inherited over-limit pending data, streamed reads independent of cloud size, and bounded conflict-copy duplication.
+- Three Flutter widget tests passed. They cover legacy engine compatibility, editable content allowance in online-only mode, settings IPC, per-file explanations, safe cleanup invocation, and aggregate clipboard reports excluding filenames. Flutter analysis and strict Clippy passed during implementation.
+- Actual WinFsp demo test passed: 17 MiB checksum, streamed reads without disk copies, partial edits, file replacement/rename/delete, a 64 MiB content boundary, native disk-full rejection, preservation of accepted data, protected cleanup while open, upload/cleanup recovery, and unmount.
+- The new allowance has been tested with the isolated local remote, not a new live Google acceptance run. The previously recorded 0.3.0 Google tests remain historical evidence.
+- The 0.4.0 core and UI support the new quota on both adapters in source. macOS runtime and compilation are not established by these Windows results; its gated tests execute zero cases on Windows. Mac build-script Rust tests and Clippy were re-enabled. See PLATFORMS.md.
+
+The allowance counts managed content-file lengths, not physical allocation or all process memory. Existing over-limit pending work is preserved; new growth is refused. Multi-request operations can retain an accepted partial destination after a later write is rejected. Large new files require sufficient staging allowance.
+
 ## Repository publication checks
 
 Before the initial source publication on 2026-10-29:
