@@ -36,7 +36,9 @@ mkdir -p release
 APP=release/StorageBridge.app
 ditto desktop/build/macos/Build/Products/Release/StorageBridge.app "$APP"
 cp target/release/storage-bridge "$APP/Contents/MacOS/storage-bridge"
-/usr/bin/lipo -verify_arch "$(uname -m)" "$APP/Contents/MacOS/StorageBridge" "$APP/Contents/MacOS/storage-bridge"
+for binary in "$APP/Contents/MacOS/StorageBridge" "$APP/Contents/MacOS/storage-bridge"; do
+  /usr/bin/lipo -verify_arch "$(uname -m)" "$binary"
+done
 cp README.md LICENSE THIRD_PARTY_NOTICES.md SUPPORT.md PLATFORMS.md PRODUCT.md VALIDATION.md "$APP/Contents/Resources/"
 codesign --force --sign - "$APP/Contents/MacOS/storage-bridge"
 codesign --force --deep --sign - "$APP"
