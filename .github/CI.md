@@ -1,6 +1,6 @@
 # Continuous integration
 
-`workflows/ci.yml` runs on every branch/tag push, pull request, merge-queue group, and manual dispatch. There are no path filters. A push event checks its resulting revision; a multi-commit push does not separately test every intermediate ancestor. Older push runs remain active. Superseded PR runs are cancelled so the latest PR revision is checked.
+`workflows/ci.yml` runs on every branch/tag push, pull request, merge-queue group, and manual dispatch. There are no path filters. A push event checks its resulting revision; a multi-commit push does not separately test every intermediate ancestor. Push runs have unique concurrency groups so newer pushes cannot cancel queued revisions. Superseded PR runs are cancelled so the latest PR revision is checked.
 
 ## Automatic checks
 
@@ -16,7 +16,7 @@ The SDK is pinned to Flutter 3.47.5. Rust uses the stable channel and records it
 
 The Windows prerequisite helper installs libclang, the pinned signed WinFsp release, and Inno Setup if absent. The installer smoke test reads its version from the installer source and refuses to run in an account with an existing Storage Bridge installation. Use disposable CI accounts for installation tests.
 
-The Mac helper installs the macFUSE user-space SDK for compilation/linking. Hosted checks do not approve or load the driver and do not establish Finder/native mounting acceptance. Tests use fake HTTP responses and private demo remotes. No Google OAuth credentials, account secrets, release-signing certificates, or personal data are supplied to PR code. Mac build artifacts have local ad-hoc signatures and are not notarized distribution releases.
+The Mac helper installs the macFUSE user-space SDK for compilation/linking. The build script selects Flutter's supported arm64 target on Apple Silicon (rather than Xcode's possible arm64e native subtype) and verifies that the app and bundled Rust engine contain the runner's architecture. Hosted checks do not approve or load the driver and do not establish Finder/native mounting acceptance. Tests use fake HTTP responses and private demo remotes. No Google OAuth credentials, account secrets, release-signing certificates, or personal data are supplied to PR code. Mac build artifacts have local ad-hoc signatures and are not notarized distribution releases.
 
 ## Require checks before merging
 
