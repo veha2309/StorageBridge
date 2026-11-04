@@ -375,7 +375,8 @@ fn sqlite_discards_results_when_revision_changes_and_rejects_cloud_sidecars() {
     assert!(error.to_string().contains("changed"));
     remote.changed.store(false, Ordering::SeqCst);
     remote.change_after_range.store(false, Ordering::SeqCst);
-    let sidecar = tmp.path().join("snapshot.sqlite-wal");
+    // Windows/macOS can create sidecars with a differently cased database basename.
+    let sidecar = tmp.path().join("SNAPSHOT.SQLITE-wal");
     std::fs::write(&sidecar, b"journal").unwrap();
     rt.queue_import(&sidecar, "", false).unwrap();
     rt.tick_imports().unwrap();

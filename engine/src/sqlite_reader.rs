@@ -398,7 +398,8 @@ impl crate::runtime::Runtime {
         ensure!(
             !siblings.iter().any(|n| ["-wal", "-shm", "-journal"]
                 .iter()
-                .any(|suffix| n.name == format!("{}{suffix}", fresh.name))),
+                .any(|suffix| n.name.to_lowercase()
+                    == format!("{}{suffix}", fresh.name).to_lowercase())),
             "Cloud journal sidecars are present. Use a clean, standalone SQLite snapshot"
         );
         query(remote, cache, fresh, sql)
