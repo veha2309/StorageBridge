@@ -125,6 +125,5 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender.send(()).unwrap();
         assert!(wait_ready(receiver).is_ok());
-        drop(Library(std::ptr::null_mut()));
     }
 }
