@@ -8,6 +8,121 @@ import 'package:liquid_ui_components/liquid_ui_components.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  testWidgets(
+    'direct transfer uses native source path and explicit verified move',
+    (tester) async {
+      tester.view.physicalSize = const Size(1400, 1100);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      Map<String, dynamic>? imported;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(native, (call) async {
+            if (call.method == 'chooseSource') return r'C:\fixtures\large.bin';
+            final payload =
+                jsonDecode(call.arguments as String) as Map<String, dynamic>;
+            if (payload['method'] == 'import_file') {
+              imported = (payload['params'] as Map).cast<String, dynamic>();
+            }
+            return jsonEncode({
+              'version': 1,
+              'ok': true,
+              'result': payload['method'] == 'status'
+                  ? {
+                      'connected': true,
+                      'supports_direct_upload': true,
+                      'supports_move_source': true,
+                      'direct_uploads': {'jobs': [], 'source_bytes': 0},
+                    }
+                  : {},
+            });
+          });
+      await tester.pumpWidget(const StorageBridgeApp());
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Transfers'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Choose local file'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('import-folder')), 'backups');
+      await tester.ensureVisible(find.text('Move after verified upload'));
+      await tester.tap(find.text('Move after verified upload'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Upload and move'));
+      await tester.tap(find.text('Upload and move'));
+      await tester.pumpAndSettle();
+      expect(imported, {
+        'source_path': r'C:\fixtures\large.bin',
+        'folder': 'backups',
+        'move_source': true,
+      });
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+  testWidgets(
+    'SQLite tab sends a read-only query and displays bounded results',
+    (tester) async {
+      tester.view.physicalSize = const Size(1400, 1200);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      Map<String, dynamic>? query;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(native, (call) async {
+            final payload =
+                jsonDecode(call.arguments as String) as Map<String, dynamic>;
+            if (payload['method'] == 'sqlite_query') {
+              query = (payload['params'] as Map).cast<String, dynamic>();
+            }
+            return jsonEncode({
+              'version': 1,
+              'ok': true,
+              'result': payload['method'] == 'status'
+                  ? {
+                      'connected': true,
+                      'supports_sqlite_query': true,
+                      'sqlite_query': query == null
+                          ? {'state': 'idle'}
+                          : {
+                              'state': 'complete',
+                              'result': {
+                                'columns': ['name'],
+                                'rows': [
+                                  ['cloud result'],
+                                ],
+                                'version': '7',
+                                'file_size': 3221225472,
+                                'truncated': false,
+                              },
+                            },
+                    }
+                  : {},
+            });
+          });
+      await tester.pumpWidget(const StorageBridgeApp());
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('SQLite'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('sqlite-path')),
+        'backups/data.sqlite',
+      );
+      await tester.enterText(
+        find.byKey(const Key('sqlite-sql')),
+        'SELECT name FROM items WHERE id=7',
+      );
+      await tester.ensureVisible(find.text('Run read-only query'));
+      await tester.tap(find.text('Run read-only query'));
+      await tester.pumpAndSettle();
+      expect(query, {
+        'path': 'backups/data.sqlite',
+        'sql': 'SELECT name FROM items WHERE id=7',
+      });
+      expect(find.text('cloud result'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
   testWidgets('disconnected account shows setup and missing driver', (
     tester,
   ) async {

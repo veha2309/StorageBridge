@@ -99,6 +99,28 @@ impl Remote for LocalRemote {
     fn get(&self, id: &str) -> Result<Option<Node>> {
         Ok(self.nodes.lock().get(id).filter(|n| !n.deleted).cloned())
     }
+    fn sha256(&self, n: &Node) -> Result<Option<String>> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let before = self.get(&n.id)?.context("File not found")?;
+        anyhow::ensure!(before.version == n.version, "Remote file changed");
+        let mut file = std::fs::File::open(self.root.join(&n.id))?;
+        let mut digest = Sha256::new();
+        let mut block = vec![0; 1024 * 1024];
+        loop {
+            let count = file.read(&mut block)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&block[..count]);
+        }
+        anyhow::ensure!(
+            self.get(&n.id)?
+                .is_some_and(|after| after.version == before.version),
+            "Remote file changed"
+        );
+        Ok(Some(format!("{:x}", digest.finalize())))
+    }
     fn generate_id(&self) -> Result<String> {
         Ok(uuid::Uuid::new_v4().to_string())
     }

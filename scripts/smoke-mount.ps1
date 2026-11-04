@@ -84,6 +84,44 @@ try {
     } finally { $boundedStream.Dispose() }
     Wait-TestUploads
     if ((Invoke-TestBridge status).storage.write_blocked) { throw 'Allowance did not recover after upload cleanup' }
+    # Direct moves read the original without a second managed content file, even above the allowance.
+    $source = Join-Path $env:TEMP "storagebridge-direct-$instance.bin"
+    $stream = [System.IO.File]::Create($source)
+    try { $stream.SetLength(65 * 1024 * 1024); $stream.WriteByte(123) } finally { $stream.Dispose() }
+    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    $destination = Split-Path -Leaf $folder
+    $direct = Invoke-TestBridge import_file @{source_path=$source; folder=$destination; move_source=$true}
+    for ($attempt=0; $attempt -lt 120; $attempt++) {
+        $current = Invoke-TestBridge status
+        if ($current.cache_bytes -ne 0) { throw 'Direct move created managed staging content' }
+        $job = @($current.direct_uploads.jobs | Where-Object id -EQ $direct.id)[0]
+        if ($job.state -eq 'complete') { break }
+        if ($job.error) { throw $job.error }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($job.state -ne 'complete' -or (Test-Path -LiteralPath $source)) { throw 'Verified direct move did not remove original' }
+    $directPath = Join-Path $folder (Split-Path -Leaf $source)
+    if ((Get-FileHash -LiteralPath $directPath -Algorithm SHA256).Hash -ne $sourceHash) { throw 'Direct move checksum mismatch' }
+    if ((Invoke-TestBridge status).cache_bytes -ne 0) { throw 'Reading direct upload created disk content' }
+    [System.IO.File]::Delete($directPath)
+
+    # Exercise the async read-only query IPC against a real closed SQLite image.
+    $sqliteSource = Join-Path $env:TEMP "storagebridge-sqlite-$instance.sqlite"
+    $fixture = 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)"); c.execute("INSERT INTO items VALUES(7, ''range query works'')"); c.commit(); c.close()'
+    & python -c $fixture $sqliteSource
+    if ($LASTEXITCODE) { throw 'Cannot create SQLite test fixture' }
+    Invoke-TestBridge import_file @{source_path=$sqliteSource; folder=$destination; move_source=$true} | Out-Null
+    Wait-TestUploads
+    $sqlitePath = "$destination/$(Split-Path -Leaf $sqliteSource)"
+    Invoke-TestBridge sqlite_query @{path=$sqlitePath; sql='SELECT name FROM items WHERE id=7'} | Out-Null
+    for ($attempt=0; $attempt -lt 120; $attempt++) {
+        $query = (Invoke-TestBridge status).sqlite_query
+        if ($query.state -ne 'running') { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($query.state -ne 'complete' -or $query.result.rows[0][0] -ne 'range query works') { throw ($query | ConvertTo-Json -Depth 6) }
+    if ((Invoke-TestBridge status).cache_bytes -ne 0) { throw 'SQLite query created a disk copy' }
+    [System.IO.File]::Delete((Join-Path $folder (Split-Path -Leaf $sqliteSource)))
     [System.IO.File]::Delete($bounded)
     [System.IO.File]::Delete($large)
     $empty = Join-Path $folder 'empty.txt'
@@ -100,7 +138,7 @@ try {
     Invoke-TestBridge unmount | Out-Null
     Wait-TestUploads
     Invoke-TestBridge shutdown | Out-Null
-    'PASS: streaming, partial edits, 17 MiB checksum, zero read disk cache, enforced 64 MiB allowance/disk-full rejection/recovery, replace/rename/delete/unmount'
+    'PASS: streaming, partial edits, checksums, zero read disk cache, enforced quota/recovery, 65 MiB direct move above 64 MiB allowance, SQLite range query IPC, replace/rename/delete/unmount'
 } finally {
     try { Invoke-TestBridge unmount | Out-Null; Invoke-TestBridge shutdown | Out-Null } catch {}
     if (-not $process.HasExited) { $process.WaitForExit(3000) | Out-Null }

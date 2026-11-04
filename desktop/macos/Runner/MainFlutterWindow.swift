@@ -62,6 +62,13 @@ class MainFlutterWindow: NSWindow, NSWindowDelegate {
             DispatchQueue.main.async { result(FlutterError(code: "bridge", message: error.localizedDescription, details: nil)) }
           }
         }
+      case "chooseSource":
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.beginSheetModal(for: self) { response in
+          result(response == .OK ? panel.url?.path : nil)
+        }
       case "chooseClient":
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.json]

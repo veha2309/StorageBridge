@@ -16,6 +16,10 @@ pub type ChangeBatch = (Vec<(String, Option<Node>)>, String);
 pub trait Remote: Send + Sync {
     fn list(&self, parent: &str) -> Result<Vec<Node>>;
     fn get(&self, id: &str) -> Result<Option<Node>>;
+    /// A provider-confirmed checksum for exactly this revision; None must never permit deletion.
+    fn sha256(&self, _node: &Node) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn generate_id(&self) -> Result<String>;
     fn download(&self, id: &str, target: &Path) -> Result<()>;
     fn read_range(&self, _node: &Node, _offset: u64, _length: usize) -> Result<Vec<u8>> {
@@ -200,6 +204,22 @@ impl Remote for GoogleDrive {
             return Ok(None);
         }
         Ok(Some(node(v)?))
+    }
+    fn sha256(&self, n: &Node) -> Result<Option<String>> {
+        let value: Value = Self::checked(
+            self.request(reqwest::Method::GET, &format!("{API}/files/{}", n.id))?
+                .query(&[("fields", "id,size,version,sha256Checksum,trashed")])
+                .send()?,
+        )?
+        .json()?;
+        anyhow::ensure!(
+            value["trashed"] != true
+                && value["id"] == n.id
+                && value["version"].as_str() == Some(&n.version)
+                && value["size"].as_str().and_then(|s| s.parse::<u64>().ok()) == Some(n.size),
+            "Remote file changed during upload verification; original retained"
+        );
+        Ok(value["sha256Checksum"].as_str().map(str::to_lowercase))
     }
     fn generate_id(&self) -> Result<String> {
         let v: Value = Self::checked(

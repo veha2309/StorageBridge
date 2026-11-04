@@ -13,6 +13,8 @@ Storage Bridge is a Windows-first personal cloud-drive preview built with Flutte
 - Browser-based Google desktop OAuth with PKCE and a loopback callback; one account and a scoped My Drive folder.
 - Metadata-only directory browsing, stable Drive file identities, and persisted Windows-safe aliases.
 - HTTP range reads in 1 MiB blocks through a bounded 32 MiB RAM cache, without whole-file read copies on disk.
+- Direct source-backed uploads larger than the managed allowance, with durable retries and provider SHA-256 verification; Windows can remove the original after verification without a second local content copy.
+- A dedicated read-only SQLite query tab using version-pinned cloud range reads, without a local database copy.
 - Durable local staging for new content and changed-byte journals for edits to uncached files.
 - Resumable uploads, persisted pending operations, retries, remote change polling, and explicit upload errors.
 - Online-only cleanup, adjustable retained-file cache budget, and separate RAM/disk usage counters.
@@ -66,7 +68,23 @@ The Overview shows pending, retained, and recovery bytes, with **Why space is us
 
 Lowering the limit below protected content is refused. Older installations may already have more pending content than the new default; recovery preserves it, reports the excess, and blocks additional growth until uploads or cleanup free space. In-place overwrites that require no growth remain possible. Partial journals are append-only until upload, so repeated changes can use more journal bytes than the final changed region.
 
-This allowance measures logical content-file lengths, conservatively including sparse-file lengths. It is not an exact physical disk-allocation cap: filesystem clusters/metadata, SQLite, credentials, binaries, paging, and other applications are outside it. Pending uploads wait for writable handles to close. Creating or replacing a new file larger than the allowance requires raising the allowance; arbitrary large writes are not promised with zero staging.
+This allowance measures logical content-file lengths, conservatively including sparse-file lengths. It is not an exact physical disk-allocation cap: filesystem clusters/metadata, SQLite, credentials, binaries, paging, and other applications are outside it. Pending mounted-file uploads wait for writable handles to close. Explorer/Finder copies and arbitrary application writes still require enough staging allowance. Use the separate direct-transfer workflow below to upload an existing local file larger than that allowance.
+
+## Direct upload and verified move (0.4.0)
+
+For example, upload an existing **3 GB file with a 1 GiB managed allowance** through **Transfers → Choose local file**, select an existing destination folder relative to the mounted root (blank means root), and choose **Upload directly**. The engine reads the original in bounded chunks and uses Google resumable uploads; it never creates a second content copy in its cache. Source bytes already on your disk remain outside the managed allowance and are shown separately in Transfers. Hashing reads the whole original locally; uploading still sends its complete contents over the network.
+
+On Windows, enable **Move after verified upload** to remove the original only after Google reports the expected file size and matching SHA-256 checksum, and a final cloud revision check succeeds. A Windows file-handle lease prevents writers and path replacement during transfer; deletion targets that same handle. Keep the original in place and close it in other applications until completion. The app persists source identity, size, modification time, checksum, remote ID, and transfer state, so it can resume after restart and recognize an upload whose final acknowledgement was lost. If the source changed or was replaced, it is not deleted. Missing checksums, network errors, or mismatches retain it for retry. **Dismiss** stops a failed/inactive job without deleting its source or uploaded cloud file.
+
+Automatic source removal is currently **Windows-only**; macOS direct upload retains the source. This is a dedicated app action: **Explorer Cut/Paste and Finder moves still use normal filesystem staging**, and can hit the allowance. Direct transfer accepts one regular local file at a time, queues up to 32 jobs, refuses occupied destination names, and does not recursively upload folders. It does not provide a zero-disk guarantee for the OS, other applications, metadata, or paging.
+
+## Read-only cloud SQLite (0.4.0)
+
+Use a closed, standalone SQLite backup in **DELETE journal mode**, without `-wal`, `-shm`, or `-journal` sidecars. Upload it with the direct-transfer controls or place it in `My Drive/StorageBridge`. In **SQLite**, enter its path relative to the mounted root (for example `backups/data.sqlite`) and run an indexed query such as `SELECT name FROM items WHERE id=427`. This reader uses a custom read-only SQLite VFS over the shared 1 MiB range cache. Needed pages stream into RAM; no database file is materialized on disk. SQLite also uses its own working memory, separate from the 32 MiB range cache.
+
+The reader pins a cloud revision and discards results if it changes. Writes, ATTACH, user PRAGMAs, extension loading, recursive queries, temporary sorts, and materialized query plans are refused. Results are capped at 200 rows and 256 KiB, text cells at 1024 characters, and blobs display their byte length. SQL is capped at 16 KiB and values at 1 MiB. A 30-second progress/deadline check bounds execution between callbacks; an in-flight network request can take longer. Indexed queries can read a small portion of a large file; scans and aggregate queries may transfer every page. These restrictions intentionally exclude some otherwise valid SELECT statements.
+
+This feature does **not** make a mounted SQLite file safe for live database writes or multi-device transactions. Export a fresh standalone backup when you need new data. The constraints follow SQLite's [immutable database requirements](https://sqlite.org/uri.html#uriimmutable) and [WAL limitations](https://sqlite.org/wal.html). Google supplies binary-file checksums via its [file metadata API](https://developers.google.com/workspace/drive/api/reference/rest/v3/files).
 
 ## Streaming reads and hybrid writes
 

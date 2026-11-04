@@ -132,6 +132,18 @@ fn run() -> Result<()> {
             std::thread::sleep(Duration::from_secs(30));
         }
     });
+    let direct = runtime.clone();
+    let account = auth.clone();
+    std::thread::spawn(move || {
+        loop {
+            if (demo || account.connected())
+                && let Err(error) = direct.tick_imports()
+            {
+                direct.engine.lock().last_error = Some(error.to_string());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
     let mut host = None;
     if engine.lock().store.setting("startup").as_deref() == Some("true")
         && (demo || auth.connected())
@@ -167,6 +179,7 @@ fn run() -> Result<()> {
                         status
                     };
                     s["transfer"] = json!(*progress.lock());
+                    s["sqlite_query"] = runtime.query_state.lock().clone();
                     s["scope_folder"] = json!(if demo {
                         "Local test drive"
                     } else {
@@ -282,6 +295,35 @@ fn run() -> Result<()> {
                             .store
                             .set("startup", if enabled { "true" } else { "false" })?;
                     }
+                    Ok(json!({}))
+                }
+                "import_file" => {
+                    ensure!(demo || auth.connected(), "Sign in first");
+                    runtime.initialize()?;
+                    let path = p["source_path"]
+                        .as_str()
+                        .context("Choose a local source file")?;
+                    ensure!(path.len() <= 32768, "Source path is too long");
+                    let folder = p["folder"].as_str().unwrap_or("");
+                    ensure!(folder.len() <= 4096, "Destination path is too long");
+                    let move_source = p["move_source"].as_bool().unwrap_or(false);
+                    let id =
+                        runtime.queue_import(std::path::Path::new(path), folder, move_source)?;
+                    Ok(json!({"id":id}))
+                }
+                "dismiss_import" => {
+                    runtime.dismiss_import(p["id"].as_str().context("Missing transfer ID")?)?;
+                    Ok(json!({}))
+                }
+                "sqlite_query" => {
+                    ensure!(demo || auth.connected(), "Sign in first");
+                    runtime.start_sqlite_query(
+                        p["path"]
+                            .as_str()
+                            .context("Enter a cloud database path")?
+                            .into(),
+                        p["sql"].as_str().context("Enter a read-only query")?.into(),
+                    )?;
                     Ok(json!({}))
                 }
                 "release_cache" => {

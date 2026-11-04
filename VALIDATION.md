@@ -1,12 +1,21 @@
 # Windows preview validation
 
+## Direct transfers and SQLite reader 0.4.0 — 2026-11-04
+
+- 67 Rust tests passed on Windows, including 12 new tests covering source-backed uploads larger than the allowance, missing/incorrect checksums, lost upload acknowledgements and restart recovery, changed/replaced sources, source-handle sharing protection, recovery after verified deletion, engine-data protection, SQLite journal rejection, read-only SQL restrictions, cloud sidecars/revision changes, and result caps.
+- Five Flutter widget tests passed, including native file selection → direct move IPC and cloud SQLite query → result display. Strict Flutter analysis, Clippy and formatting checks passed.
+- The actual WinFsp demo smoke test passed with a **65 MiB original and a 64 MiB allowance**: zero managed staging growth during direct upload, verified source removal, checksum readback through the mounted drive, and zero content-disk growth on reads. A real closed SQLite image was directly uploaded/moved, queried through asynchronous named-pipe IPC, and returned its indexed result without a local database copy.
+- The 3 GiB SQLite test uses a real SQLite image with virtual trailing zeroes; its indexed lookup fetched at most 2 MiB. This proves range behavior in the fixture, not real Google performance or a measured 3 GiB transfer. The direct upload integration fixture is 8 MiB against a 1 MiB allowance. Resumable network offsets remain covered by the existing HTTP fixture tests.
+- Tests and mounts use isolated local remotes and disposable sources. No new live Google acceptance run or live macFUSE test was performed for these features. Mac direct uploads retain the original; automatic removal requires the Windows native lease.
+- CI runs the shared tests on Windows and both Mac architectures for each push/PR; the extended Windows mount smoke runs the direct-transfer and SQLite IPC acceptance paths as well. Live Google checksum availability, interrupted multi-gigabyte transfers, and actual Mac operation still require acceptance with disposable user data.
+
 ## CI configuration — 2026-11-04
 
 - Added push/PR/merge-group workflows for Windows x64, macOS Apple Silicon, and macOS Intel, with a stable aggregate gate and a separate manual native Mac acceptance workflow.
 - actionlint 1.7.12 validated both workflow definitions locally. Python version-consistency checks, PowerShell parser checks, and Bash syntax checks passed.
 - Verified the pinned WinFsp installer's SHA-256 and valid Authenticode signature before configuring its CI prerequisite helper.
 - Installer smoke checks now derive the app version from the installer source and require a clean account. The existing personal installation was not uninstalled to exercise that CI-only path.
-- These local configuration checks do not represent completed hosted Windows/Mac CI runs. Results from GitHub Actions must be reviewed after publication; native Mac mounting remains a dedicated-runner acceptance test.
+- The baseline at `082e37c` passed all hosted Windows/Mac jobs: [push run 41791210916](https://github.com/veha2309/StorageBridge/actions/runs/41791210916). This predates the direct-transfer/SQLite additions above; their new run must pass separately. Native Mac mounting remains a dedicated-runner acceptance test.
 
 ## Enforced local content allowance 0.4.0 — 2026-11-04
 

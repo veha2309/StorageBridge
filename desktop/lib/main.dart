@@ -78,6 +78,13 @@ class _DashboardState extends State<Dashboard> {
   Timer? timer;
   final cache = TextEditingController(text: '10');
   final contentLimit = TextEditingController(text: '1');
+  final importFolder = TextEditingController();
+  final databasePath = TextEditingController();
+  final sql = TextEditingController(
+    text: 'SELECT name, type FROM sqlite_schema LIMIT 100',
+  );
+  String? sourcePath;
+  bool moveSource = false;
   String _version = '';
 
   @override
@@ -95,6 +102,9 @@ class _DashboardState extends State<Dashboard> {
     timer?.cancel();
     cache.dispose();
     contentLimit.dispose();
+    importFolder.dispose();
+    databasePath.dispose();
+    sql.dispose();
     super.dispose();
   }
 
@@ -303,6 +313,7 @@ class _DashboardState extends State<Dashboard> {
                                   'Transfer queue',
                                   'Recent activity',
                                   'Bridge settings',
+                                  'Cloud SQLite reader',
                                 ][page],
                                 style: const TextStyle(
                                   fontSize: 28,
@@ -361,6 +372,10 @@ class _DashboardState extends State<Dashboard> {
                         LiquidGlassNavigationItem(
                           label: 'Settings',
                           icon: Icons.tune,
+                        ),
+                        LiquidGlassNavigationItem(
+                          label: 'SQLite',
+                          icon: Icons.table_chart_outlined,
                         ),
                       ],
                     ),
@@ -668,7 +683,10 @@ class _DashboardState extends State<Dashboard> {
                           ),
                         ],
                       ),
-                    ] else if (page == 1)
+                    ] else if (page == 1) ...[
+                      if (s['supports_direct_upload'] == true)
+                        directUploadPanel(s),
+                      const SizedBox(height: 20),
                       panel('Saved locally → uploaded', [
                         const Text(
                           'Wait for pending uploads to finish before switching computers.',
@@ -680,7 +698,7 @@ class _DashboardState extends State<Dashboard> {
                               Icons.check_circle_outline,
                               color: Colors.green,
                             ),
-                            title: Text('No pending uploads'),
+                            title: Text('No staged file uploads'),
                           ),
                         if (s['transfer'] != null) ...[
                           Text(
@@ -714,8 +732,8 @@ class _DashboardState extends State<Dashboard> {
                           icon: const Icon(Icons.refresh),
                           label: const Text('Retry pending transfers'),
                         ),
-                      ])
-                    else if (page == 2)
+                      ]),
+                    ] else if (page == 2)
                       panel('Activity', [
                         if ((s['events'] as List? ?? []).isEmpty)
                           const Text(
@@ -732,6 +750,8 @@ class _DashboardState extends State<Dashboard> {
                             ),
                           ),
                       ])
+                    else if (page == 4)
+                      sqlitePanel(s)
                     else
                       panel('Storage and startup', [
                         const Text(
@@ -1064,6 +1084,200 @@ class _DashboardState extends State<Dashboard> {
       const SizedBox(height: 12),
       const Text(
         'Limit covers managed file-content lengths, including write journals. App files, metadata, filesystem overhead, Windows/macOS paging, and other apps are separate. Explorer/Finder allocation figures are not this PC’s cache usage.',
+        style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
+      ),
+    ]);
+  }
+
+  Widget directUploadPanel(Map<String, dynamic> s) {
+    final jobs = (s['direct_uploads']?['jobs'] as List?) ?? [];
+    final available = !busy && s['connected'] == true;
+    return panel('Direct upload · no second local copy', [
+      const Text(
+        'Upload a file directly from its current location. It can exceed your local content limit. Keep it in place and close it in other apps until verification finishes. Explorer Cut/Paste still uses the staged upload path.',
+      ),
+      const SizedBox(height: 16),
+      LiquidGlassButton(
+        onPressed: available
+            ? () => act(() async {
+                final path = await native.invokeMethod<String>('chooseSource');
+                if (path != null && mounted) setState(() => sourcePath = path);
+              })
+            : null,
+        child: const Text('Choose local file'),
+      ),
+      if (sourcePath != null)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: SelectableText(sourcePath!),
+        ),
+      const SizedBox(height: 12),
+      TextField(
+        key: const Key('import-folder'),
+        controller: importFolder,
+        enabled: !busy,
+        decoration: const InputDecoration(
+          labelText: 'Destination folder inside StorageBridge',
+          helperText:
+              'Leave blank for the mounted root. Existing folders only.',
+        ),
+      ),
+      const SizedBox(height: 12),
+      GlassSwitchTile(
+        title: const Text('Move after verified upload'),
+        subtitle: Text(
+          s['supports_move_source'] == true
+              ? 'Remove the original only after Google confirms its size and SHA-256 checksum. Failed verification retains it.'
+              : 'Automatic removal is available on Windows. Direct upload on macOS retains the original.',
+        ),
+        value: moveSource && s['supports_move_source'] == true,
+        onChanged: available && s['supports_move_source'] == true
+            ? (value) => setState(() => moveSource = value)
+            : null,
+      ),
+      const SizedBox(height: 12),
+      glassAction(
+        onPressed: available && sourcePath != null
+            ? () => act(() async {
+                await request('import_file', {
+                  'source_path': sourcePath,
+                  'folder': importFolder.text.trim(),
+                  'move_source':
+                      moveSource && s['supports_move_source'] == true,
+                });
+                if (mounted) setState(() => sourcePath = null);
+              })
+            : null,
+        icon: const Icon(Icons.cloud_upload_outlined),
+        label: Text(
+          moveSource && s['supports_move_source'] == true
+              ? 'Upload and move'
+              : 'Upload directly',
+        ),
+      ),
+      const SizedBox(height: 12),
+      Text(
+        '${bytes(s['direct_uploads']?['source_bytes'])} in pending original files · outside the managed content allowance',
+      ),
+      for (final job in jobs)
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(
+            job['state'] == 'complete'
+                ? Icons.check_circle_outline
+                : Icons.upload_file_outlined,
+          ),
+          title: Text('${job['name']} · ${bytes(job['size'])}'),
+          subtitle: Text(
+            '${job['move_source'] == true ? 'Move' : 'Copy'} · ${job['state'].toString().replaceAll('_', ' ')}'
+            '${job['error'] == null ? '' : '\n${job['error']}'}',
+          ),
+          trailing: job['error'] != null && job['state'] != 'source_retained'
+              ? TextButton(
+                  onPressed: busy
+                      ? null
+                      : () => act(() async {
+                          await request('dismiss_import', {'id': job['id']});
+                        }),
+                  child: const Text('Dismiss'),
+                )
+              : null,
+        ),
+      const Text(
+        'SQLite uploads require a closed, standalone backup in DELETE journal mode. No WAL or journal sidecars. Dismissing a failed job retains the source and any uploaded cloud file.',
+        style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
+      ),
+    ]);
+  }
+
+  Widget sqlitePanel(Map<String, dynamic> s) {
+    final query = (s['sqlite_query'] as Map?) ?? {};
+    final result = (query['result'] as Map?) ?? {};
+    final columns = (result['columns'] as List?) ?? [];
+    final rows = (result['rows'] as List?) ?? [];
+    final running = query['state'] == 'running';
+    return panel('Read-only cloud SQLite', [
+      const Text(
+        'Query a closed, standalone SQLite snapshot on Drive. Needed pages stream into the shared RAM buffer; no database copy is created on disk. Indexed lookups avoid reading the full database. Full scans can still transfer every page.',
+      ),
+      const SizedBox(height: 12),
+      const Text(
+        'This reader does not edit databases. Live databases, WAL, attached files and temporary sorts are unsupported. Export a backup in DELETE journal mode first.',
+      ),
+      const SizedBox(height: 16),
+      TextField(
+        key: const Key('sqlite-path'),
+        controller: databasePath,
+        enabled: !busy && !running,
+        decoration: const InputDecoration(
+          labelText: 'Database path inside StorageBridge',
+          hintText: 'backups/data.sqlite',
+        ),
+      ),
+      const SizedBox(height: 16),
+      TextField(
+        key: const Key('sqlite-sql'),
+        controller: sql,
+        minLines: 3,
+        maxLines: 8,
+        enabled: !busy && !running,
+        decoration: const InputDecoration(labelText: 'Read-only SQL query'),
+      ),
+      const SizedBox(height: 16),
+      glassAction(
+        onPressed:
+            !busy &&
+                !running &&
+                s['connected'] == true &&
+                s['supports_sqlite_query'] == true
+            ? () => act(() async {
+                await request('sqlite_query', {
+                  'path': databasePath.text.trim(),
+                  'sql': sql.text,
+                });
+              })
+            : null,
+        icon: const Icon(Icons.play_arrow),
+        label: const Text('Run read-only query'),
+      ),
+      if (running)
+        const Padding(
+          padding: EdgeInsets.only(top: 16),
+          child: LinearProgressIndicator(),
+        ),
+      if (query['error'] != null) banner(query['error'].toString()),
+      if (query['state'] == 'complete') ...[
+        const SizedBox(height: 16),
+        Text(
+          '${rows.length} rows · snapshot ${result['version']} · ${bytes(result['file_size'])} cloud file',
+        ),
+        if (result['truncated'] == true)
+          banner(
+            'Result limited to 200 rows or 256 KiB. Refine your query. Text cells are limited to 1024 characters; blobs show their size.',
+          ),
+        if (columns.isNotEmpty)
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: DataTable(
+              columns: [
+                for (final column in columns)
+                  DataColumn(label: Text(column.toString())),
+              ],
+              rows: [
+                for (final row in rows)
+                  DataRow(
+                    cells: [
+                      for (final value in row as List)
+                        DataCell(SelectableText(value?.toString() ?? 'NULL')),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+      ],
+      const SizedBox(height: 12),
+      const Text(
+        'Results are discarded if the cloud revision changes. Queries have a 30-second execution check; a network request may take longer. SQLite working memory and OS paging are separate from the 32 MiB read buffer.',
         style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
       ),
     ]);

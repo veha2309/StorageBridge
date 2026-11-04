@@ -12,6 +12,9 @@ The architecture supports separate Windows and macOS binaries using the same Flu
 | Local IPC | Per-user named pipe | Private Unix socket directory and instance lock |
 | Startup | User Run registry entry | User LaunchAgent |
 | Engine and quota | Shared Rust code | Shared Rust code |
+| Direct upload | Source-backed, resumable, SHA-256 verified | Same shared upload path; original retained |
+| Verified source removal | Handle-based Windows lease/deletion | Disabled pending a native safe-removal adapter |
+| SQLite snapshot reader | Read-only range VFS + Dart UI | Same Rust reader + Dart UI; native runtime validation still required |
 | Packaging | Portable bundle + Inno Setup | `.app` bundle + ZIP, local ad-hoc signature |
 | Current verification | Windows tests and real WinFsp mount | Source inspection only for this update |
 

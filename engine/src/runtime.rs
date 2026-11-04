@@ -17,6 +17,7 @@ pub struct Runtime {
     gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     initialize: Mutex<()>,
     listings: Mutex<HashSet<String>>,
+    pub query_state: Arc<Mutex<serde_json::Value>>,
 }
 struct ReadLease {
     engine: Arc<Mutex<Engine>>,
@@ -38,6 +39,7 @@ impl Runtime {
             gates: Mutex::new(HashMap::new()),
             initialize: Mutex::new(()),
             listings: Mutex::new(HashSet::new()),
+            query_state: Arc::new(Mutex::new(serde_json::json!({"state":"idle"}))),
         }
     }
     pub fn gate(&self, id: &str) -> Arc<Mutex<()>> {

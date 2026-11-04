@@ -101,7 +101,7 @@ jobs:
           }
       - name: Rust formatting
         run: cargo fmt --all -- --check
-      - name: Rust tests including recovery, quotas, and platform IPC
+      - name: Rust tests including direct transfers, SQLite ranges, recovery, quotas and IPC
         run: |
           mkdir -p test-results
           cargo test --locked 2>&1 | tee test-results/rust-tests.log
@@ -132,7 +132,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: ./scripts/build-windows.ps1 -SkipTests -Installer
-      - name: Windows mounted-drive and storage-limit smoke test
+      - name: Windows mount, quota, verified direct move and SQLite IPC smoke test
         if: matrix.platform == 'windows'
         shell: pwsh
         timeout-minutes: 5

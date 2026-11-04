@@ -996,6 +996,14 @@ impl Engine {
         self.store
             .db
             .execute("UPDATE jobs SET next_try=0,attempts=0,error=NULL", [])?;
+        for mut job in crate::imports::Import::all(&self.store)? {
+            if !job.terminal() {
+                job.next_try = 0;
+                job.attempts = 0;
+                job.error = None;
+                job.save(&self.store)?;
+            }
+        }
         Ok(())
     }
     pub fn status(&self) -> Result<Value> {
@@ -1014,6 +1022,8 @@ impl Engine {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let transfers:Vec<_>=jobs.into_iter().map(|(id,attempts,error)|json!({"id":id,"name":self.store.get(&id).map(|n|n.alias).unwrap_or(id.clone()),"state":if error.is_some(){"retrying"}else if self.open.contains_key(&id){"saved_locally"}else{"queued"},"attempts":attempts,"error":error})).collect();
         let storage = self.storage_usage()?;
+        let direct = crate::imports::status(&self.store)?;
+        let pending = transfers.len() as u64 + direct["pending"].as_u64().unwrap_or(0);
         let cache = storage.used_bytes;
         let mut stmt = self
             .store
@@ -1025,7 +1035,7 @@ impl Engine {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(
-            json!({"open_files":self.open.len(),"streaming":true,"storage":storage,"read_cache_bytes":self.read_cache.bytes(),"read_cache_budget":crate::streaming::RAM_BUDGET,"online_only":self.online_only(),"pending":transfers.len(),"transfers":transfers,"cache_bytes":cache,"cache_budget":self.store.setting("cache_budget").and_then(|s|s.parse::<u64>().ok()).unwrap_or(DEFAULT_BUDGET),"startup":self.store.setting("startup").as_deref()==Some("true"),"drive_letter":self.store.setting("drive_letter").unwrap_or("G:".into()),"last_error":self.last_error,"about":self.store.setting("about").and_then(|s|serde_json::from_str::<Value>(&s).ok()),"events":events}),
+            json!({"open_files":self.open.len(),"streaming":true,"direct_uploads":direct,"supports_direct_upload":true,"supports_move_source":cfg!(windows),"supports_sqlite_query":true,"storage":storage,"read_cache_bytes":self.read_cache.bytes(),"read_cache_budget":crate::streaming::RAM_BUDGET,"online_only":self.online_only(),"pending":pending,"transfers":transfers,"cache_bytes":cache,"cache_budget":self.store.setting("cache_budget").and_then(|s|s.parse::<u64>().ok()).unwrap_or(DEFAULT_BUDGET),"startup":self.store.setting("startup").as_deref()==Some("true"),"drive_letter":self.store.setting("drive_letter").unwrap_or("G:".into()),"last_error":self.last_error,"about":self.store.setting("about").and_then(|s|serde_json::from_str::<Value>(&s).ok()),"events":events}),
         )
     }
 }
