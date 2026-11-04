@@ -12,6 +12,12 @@ Check **Overview → Your local storage budget**. This limit is separate from fr
 
 Do not delete the cache or database to clear an error. If the physical disk is also full, free unrelated space first so the application and its metadata store can operate.
 
+## Copying a large cloud file back stops partway
+
+Check the app's error before changing the content allowance. Copying **from** the mounted drive streams reads and does not require allowance equal to the cloud file size. The destination disk still needs space for the copy.
+
+The early 0.4.0 reader could report "Remote file changed; close and reopen it" when Google's general metadata version changed during video processing. The updated reader distinguishes the blob content revision, retries transient range failures and batches sequential reads without creating a staging copy. Install/restart with the updated engine after pending uploads finish, close the failed copy's handles, then restart the copy. Real content changes are still refused to prevent mixed revisions. Preserve a failed destination until its status is understood; it may be partial.
+
 ## A large original exceeds the allowance
 
 Use **Transfers → Choose local file → Upload directly** to stream the existing original without a second managed content copy. For a verified Windows move, enable **Move after verified upload**. Explorer Cut/Paste still stages the destination and may hit the allowance. The original remains on disk until verification; do not edit, rename, or remove it during a transfer. Only regular local files and existing destination folders are supported.

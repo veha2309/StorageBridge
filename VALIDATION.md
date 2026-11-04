@@ -1,5 +1,16 @@
 # Windows preview validation
 
+## Large video readback correction — 2026-11-04
+
+- The running Google engine recorded `Remote file changed; close and reopen it` while a 3,410,694,231-byte video was being copied back. It was still running, with zero managed content bytes; the 4 GiB allowance was not the read-side failure. Another source-backed upload was allowed to finish before the idle engine was replaced and the same drive letter remounted.
+- Fixed a reproducible false read failure: Google's general file `version` includes metadata-only changes, while `headRevisionId` identifies blob content. Reads now validate blob revision and size after receiving ranges; actual content changes are still refused. Legacy metadata without a blob revision keeps conservative version/ETag checks. Added backward-compatible optional node metadata.
+- Added up to two retries for transient HTTP/network failures and interrupted bodies. Sequential reads use adaptive windows up to 8 MiB with a 32 MiB retained RAM cache, and fall back to 1 MiB pieces on broken/slow wide responses. No complete read copy is written to the content directory.
+- All 75 Windows Rust tests and strict Clippy passed. New fixtures cover metadata-only version/ETag changes, real content changes, HTTP 429/503, retry exhaustion, disconnected bodies, wide-range fallback, and content-key cache invalidation. A complete 3,410,694,231-byte synthetic stream verifies every block across the 2 GiB boundary and EOF without managed disk growth.
+- The isolated real WinFsp smoke passed against the corrected engine: normal reads/writes, replacement saves, disk-full rejection/recovery, direct move above the allowance, SQLite query IPC and unmount.
+- Live mounted samples of the affected Google video at byte 0, 2,147,483,648 and 3,409,645,655 matched independently fetched Google ranges. **The full 3,410,694,231-byte mounted stream then matched Google's SHA-256**, completing in 679.3 seconds. This read used the real WinFsp mount and Google account, not the local remote or a synthetic fixture. The verifier created no local media copy. During the run, the engine reported zero managed content bytes, retained RAM at or below 32 MiB, and no read error. At completion the mount remained connected with zero pending work and zero open handles.
+
+The diagnostic `engine/examples/verify_mounted_read.rs` reads existing configured Google credentials without logging them, checks the chosen file is directly inside the mounted test scope, and verifies mounted bytes without modifying cloud content or creating a local media copy. It is a developer-invoked live test, not a credential-bearing CI job.
+
 ## Direct transfers and SQLite reader 0.4.0 — 2026-11-04
 
 - 67 Rust tests passed on Windows, including 12 new tests covering source-backed uploads larger than the allowance, missing/incorrect checksums, lost upload acknowledgements and restart recovery, changed/replaced sources, source-handle sharing protection, recovery after verified deletion, engine-data protection, SQLite journal rejection, read-only SQL restrictions, cloud sidecars/revision changes, and result caps.

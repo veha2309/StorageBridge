@@ -26,6 +26,7 @@ impl LocalRemote {
             directory: true,
             size: 0,
             version: "1".into(),
+            head_revision: None,
             cached: false,
             dirty: false,
             deleted: false,

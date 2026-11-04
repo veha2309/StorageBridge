@@ -365,7 +365,7 @@ pub fn query(
         ensure!(
             remote
                 .get(&node.id)?
-                .is_some_and(|fresh| fresh.version == node.version),
+                .is_some_and(|fresh| fresh.same_content(&node)),
             "Cloud database changed during the query; results discarded. Retry against a stable snapshot"
         );
         Ok(

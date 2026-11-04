@@ -227,6 +227,7 @@ impl Runtime {
                     let mut e = self.engine.lock();
                     let mut current = e.store.get(id)?;
                     current.version = fresh.version.clone();
+                    current.head_revision = fresh.head_revision.clone();
                     current.size = fresh.size;
                     current.modified = fresh.modified;
                     e.store.put(&current)?;
@@ -264,6 +265,7 @@ impl Runtime {
         let e = self.engine.lock();
         let mut n = e.store.get(id)?;
         n.version = fresh.version;
+        n.head_revision = fresh.head_revision;
         n.size = fresh.size;
         n.modified = fresh.modified;
         e.store.put(&n)

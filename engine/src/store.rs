@@ -12,6 +12,9 @@ pub struct Node {
     pub directory: bool,
     pub size: u64,
     pub version: String,
+    /// Blob revision, unaffected by Drive metadata-only changes such as video processing.
+    #[serde(default)]
+    pub head_revision: Option<String>,
     pub cached: bool,
     pub dirty: bool,
     pub deleted: bool,
@@ -19,6 +22,22 @@ pub struct Node {
     pub modified: i64,
 }
 
+impl Node {
+    pub fn content_version(&self) -> String {
+        match self.head_revision.as_deref().filter(|r| !r.is_empty()) {
+            Some(revision) => format!("blob:{revision}"),
+            None => format!("metadata:{}", self.version),
+        }
+    }
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.size == other.size
+            && match (&self.head_revision, &other.head_revision) {
+                (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a == b,
+                _ => self.version == other.version,
+            }
+    }
+}
 pub struct Store {
     pub db: Connection,
 }

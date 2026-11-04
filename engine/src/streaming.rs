@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -13,6 +13,7 @@ use std::{
 
 pub const BLOCK: usize = 1024 * 1024;
 pub const RAM_BUDGET: usize = 32 * 1024 * 1024;
+pub const MAX_RANGE: usize = 8 * BLOCK;
 struct Entry {
     id: String,
     version: String,
@@ -22,6 +23,7 @@ struct Entry {
 #[derive(Default)]
 pub struct ReadCache {
     entries: Mutex<VecDeque<Entry>>,
+    next: Mutex<HashMap<(String, String), u64>>,
     active: Mutex<usize>,
     available: Condvar,
 }
@@ -36,17 +38,21 @@ impl ReadCache {
     pub fn bytes(&self) -> usize {
         self.entries.lock().iter().map(|e| e.data.len()).sum()
     }
-    fn block(&self, remote: &dyn Remote, node: &Node, offset: u64) -> Result<Arc<Vec<u8>>> {
+    fn block(&self, remote: &dyn Remote, node: &Node, offset: u64) -> Result<(u64, Arc<Vec<u8>>)> {
+        let version = node.content_version();
         {
             let mut entries = self.entries.lock();
-            if let Some(i) = entries
-                .iter()
-                .position(|e| e.id == node.id && e.version == node.version && e.offset == offset)
-            {
+            if let Some(i) = entries.iter().position(|e| {
+                e.id == node.id
+                    && e.version == version
+                    && offset >= e.offset
+                    && offset - e.offset < e.data.len() as u64
+            }) {
                 let entry = entries.remove(i).unwrap();
                 let data = entry.data.clone();
+                let base = entry.offset;
                 entries.push_back(entry);
-                return Ok(data);
+                return Ok((base, data));
             }
         }
         {
@@ -57,26 +63,42 @@ impl ReadCache {
             *active += 1;
         }
         let _permit = Permit(self);
-        let length = (node.size.saturating_sub(offset)).min(BLOCK as u64) as usize;
+        let sequential = self.next.lock().get(&(node.id.clone(), version.clone())) == Some(&offset);
+        let window = if sequential {
+            remote.sequential_range_size().clamp(BLOCK, MAX_RANGE)
+        } else {
+            BLOCK
+        };
+        let length = (node.size.saturating_sub(offset)).min(window as u64) as usize;
         let bytes = remote.read_range(node, offset, length)?;
         ensure!(
             bytes.len() == length,
             "Incomplete ranged read; no data was cached"
         );
         let data = Arc::new(bytes);
+        {
+            let mut next = self.next.lock();
+            if next.len() >= 256 {
+                next.clear();
+            }
+            next.insert(
+                (node.id.clone(), version.clone()),
+                offset + data.len() as u64,
+            );
+        }
         let mut entries = self.entries.lock();
         // Another caller may have fetched this same block while we waited.
-        entries.retain(|e| !(e.id == node.id && e.version == node.version && e.offset == offset));
+        entries.retain(|e| !(e.id == node.id && e.version == version && e.offset == offset));
         while entries.iter().map(|e| e.data.len()).sum::<usize>() + data.len() > RAM_BUDGET {
             entries.pop_front();
         }
         entries.push_back(Entry {
             id: node.id.clone(),
-            version: node.version.clone(),
+            version,
             offset,
             data: data.clone(),
         });
-        Ok(data)
+        Ok((offset, data))
     }
     pub fn read(
         &self,
@@ -90,8 +112,8 @@ impl ReadCache {
         while done < length {
             let at = offset + done as u64;
             let start = at / BLOCK as u64 * BLOCK as u64;
-            let bytes = self.block(remote, node, start)?;
-            let within = (at - start) as usize;
+            let (base, bytes) = self.block(remote, node, start)?;
+            let within = (at - base) as usize;
             let count = (length - done).min(bytes.len().saturating_sub(within));
             ensure!(count > 0, "Invalid ranged read length");
             buffer[done..done + count].copy_from_slice(&bytes[within..within + count]);

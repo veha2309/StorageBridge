@@ -230,6 +230,7 @@ impl Runtime {
                 directory: false,
                 size: job.stamp.size,
                 version: String::new(),
+                head_revision: None,
                 cached: false,
                 dirty: false,
                 deleted: false,

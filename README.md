@@ -12,7 +12,7 @@ Storage Bridge is a Windows-first personal cloud-drive preview built with Flutte
 
 - Browser-based Google desktop OAuth with PKCE and a loopback callback; one account and a scoped My Drive folder.
 - Metadata-only directory browsing, stable Drive file identities, and persisted Windows-safe aliases.
-- HTTP range reads in 1 MiB blocks through a bounded 32 MiB RAM cache, without whole-file read copies on disk.
+- HTTP range reads with a 1 MiB base block and adaptive sequential windows up to 8 MiB through a bounded 32 MiB RAM cache, without whole-file read copies on disk.
 - Direct source-backed uploads larger than the managed allowance, with durable retries and provider SHA-256 verification; Windows can remove the original after verification without a second local content copy.
 - A dedicated read-only SQLite query tab using version-pinned cloud range reads, without a local database copy.
 - Durable local staging for new content and changed-byte journals for edits to uncached files.
@@ -88,7 +88,9 @@ This feature does **not** make a mounted SQLite file safe for live database writ
 
 ## Streaming reads and hybrid writes
 
-Reads from uncached files now use HTTP byte ranges and a **32 MiB RAM cache**, in **1 MiB blocks**, with at most four simultaneous range fetches. Reading or seeking does not create a full local file. Known folder listings are returned from SQLite immediately, with stale metadata refreshed in the background. WinFsp uses asynchronous callbacks and a separate directory queue; uploads and change polling run independently without holding the metadata mutex during network calls. The mount is reported as a network drive and files are marked as not content-indexed.
+Reads from uncached files use HTTP byte ranges and a **32 MiB RAM cache**. Random access starts at **1 MiB**; contiguous Drive reads use windows up to **8 MiB** to reduce request overhead during large copies. There are at most four simultaneous range fetches. In-flight response buffers and application/OS memory are separate from the retained cache counter. Broken/slow large responses fall back to 1 MiB pieces; transient network failures, HTTP 429 and selected server errors receive up to two automatic retries before a read fails. Partial responses are never accepted as complete data.
+
+Drive blob reads use `headRevisionId` plus file size to detect actual content changes. Google's general `version` also changes for metadata and processing updates, so it no longer aborts a video copy merely because those change. The provider checks content identity after each response before caching bytes; true content changes still fail clearly. Files without a blob revision retain conservative version/ETag checks. Known folder listings are returned from SQLite immediately, with stale metadata refreshed in the background. WinFsp uses asynchronous callbacks and a separate directory queue; uploads and polling run without holding the shared metadata mutex during requests. No full read copy is created on disk.
 
 Editing an uncached file journals only changed bytes on disk. Untouched bytes are streamed through RAM when needed for reads or when assembling a resumable upload. Truncating/replacing a file does not download its old contents. New files still stage the bytes you write. Google Drive requires the completed updated file to be uploaded, so editing a large file can transfer its untouched content through RAM during upload. There is no whole-file read download stored on disk and no second assembled upload file.
 
@@ -174,7 +176,7 @@ Run the actual filesystem test with an unused drive letter (the test uses an iso
 
 It uses only the disk-backed demo remote and exercises create/read/write, streamed reads after eviction, partial edits, a 17 MiB checksum check, temporary-file replacement, rename, listing, deletion, and unmount. It never runs against a Google account. `engine/tests/recovery.rs` covers crash recovery, cache retention, remote changes, conflicts, moves, and replacement ordering. HTTP fixtures exercise Google pagination, quota errors, and resumed upload offsets.
 
-The 0.4.0 checks cover 67 Rust tests on Windows and five Flutter widget tests, including storage rejection, source-backed transfers, checksum/restart recovery, read-only SQLite ranges, concurrent writes, and report privacy. The mounted Windows smoke test includes a 64 MiB allowance, actual disk-full rejection/recovery, a verified 65 MiB direct move without managed staging growth, and SQLite query IPC. Limited live Google read/write verification was previously completed on 0.3.0; these new feature tests use isolated local remotes. See [VALIDATION.md](VALIDATION.md) for recorded evidence and remaining manual validation.
+The 0.4.0 checks cover 75 Rust tests on Windows and five Flutter widget tests, including a complete 3,410,694,231-byte synthetic read, metadata-only video changes, interrupted response recovery, adaptive sequential reads, storage rejection, source-backed transfers, SQLite ranges and report privacy. The mounted Windows smoke includes native disk-full recovery, a verified 65 MiB direct move above a 64 MiB allowance and SQLite IPC. See [VALIDATION.md](VALIDATION.md) for live Google evidence and remaining manual acceptance.
 
 ## macOS build and run
 
@@ -271,6 +273,13 @@ Diagnostics from PowerShell:
 . .\scripts\ipc.ps1
 Invoke-Bridge status | ConvertTo-Json -Depth 8
 Invoke-Bridge retry
+```
+
+A read-only live diagnostic can compare a mounted file directly inside the configured StorageBridge root with Google's bytes/checksum without creating another local content file. It uses the already configured account, refuses files outside that root, and never modifies cloud content:
+
+```powershell
+cargo run --release --example verify_mounted_read -- DRIVE_FILE_ID 'G:\video.mov' --sample
+# Omit --sample to read every mounted byte and verify Google's SHA-256.
 ```
 
 State is under `%LOCALAPPDATA%\StorageBridge\StorageBridge\data\google` (or `demo`), as resolved by the Rust `directories` crate. Keep the database and cache together. Uninstall preserves this state and pending files; never delete it while uploads remain.
