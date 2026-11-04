@@ -1277,7 +1277,7 @@ class _DashboardState extends State<Dashboard> {
       ],
       const SizedBox(height: 12),
       const Text(
-        'Results are discarded if the cloud revision changes. Queries have a 30-second execution check; a network request may take longer. SQLite working memory and OS paging are separate from the 32 MiB read buffer.',
+        'Results show up to 200 rows / 256 KiB. Text cells are limited to 1024 characters; blobs show their size. Results are discarded if the cloud revision changes. Queries have a 30-second execution check; a network request may take longer. SQLite working memory and OS paging are separate from the 32 MiB read buffer.',
         style: TextStyle(fontSize: 12, color: Color(0xff637c80)),
       ),
     ]);

@@ -317,6 +317,7 @@ fn run() -> Result<()> {
                 }
                 "sqlite_query" => {
                     ensure!(demo || auth.connected(), "Sign in first");
+                    runtime.initialize()?;
                     runtime.start_sqlite_query(
                         p["path"]
                             .as_str()

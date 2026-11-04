@@ -174,7 +174,7 @@ Run the actual filesystem test with an unused drive letter (the test uses an iso
 
 It uses only the disk-backed demo remote and exercises create/read/write, streamed reads after eviction, partial edits, a 17 MiB checksum check, temporary-file replacement, rename, listing, deletion, and unmount. It never runs against a Google account. `engine/tests/recovery.rs` covers crash recovery, cache retention, remote changes, conflicts, moves, and replacement ordering. HTTP fixtures exercise Google pagination, quota errors, and resumed upload offsets.
 
-The 0.4.0 checks cover 55 Rust tests and three Flutter widget tests, including storage rejection, restart recovery, concurrent writes, and report privacy. The mounted Windows smoke test includes a 64 MiB allowance, actual disk-full error mapping, accepted-content preservation, and recovery after upload cleanup. Limited live Google read/write verification was previously completed on 0.3.0; the new quota tests use an isolated local remote. See [VALIDATION.md](VALIDATION.md) for recorded evidence and remaining manual validation.
+The 0.4.0 checks cover 67 Rust tests on Windows and five Flutter widget tests, including storage rejection, source-backed transfers, checksum/restart recovery, read-only SQLite ranges, concurrent writes, and report privacy. The mounted Windows smoke test includes a 64 MiB allowance, actual disk-full rejection/recovery, a verified 65 MiB direct move without managed staging growth, and SQLite query IPC. Limited live Google read/write verification was previously completed on 0.3.0; these new feature tests use isolated local remotes. See [VALIDATION.md](VALIDATION.md) for recorded evidence and remaining manual validation.
 
 ## macOS build and run
 
@@ -261,7 +261,9 @@ The engine's per-user named pipe is `\\.\pipe\StorageBridge-v1-<Windows SID>`. I
 {"version":1,"method":"mount","params":{"letter":"G:"}}
 ```
 
-Responses contain `version`, `ok`, and either `result` or `error`. Methods are `status`, `configure`, `login`, `mount`, `unmount`, `settings`, `release_cache`, `retry`, and `shutdown`. Status includes queued transfers, active byte progress, cache usage, account/quota metadata, mount state, and recent events. `settings.content_limit` accepts an integer byte allowance. `status.storage` contains allowance, used/available bytes, pending/retained/recovery totals, blocked/over-limit flags, and a bounded per-file explanation. Flutter polls status every two seconds; remote changes are independently polled by the engine.
+Responses contain `version`, `ok`, and either `result` or `error`. Methods are `status`, `configure`, `login`, `mount`, `unmount`, `settings`, `release_cache`, `retry`, `import_file`, `dismiss_import`, `sqlite_query`, and `shutdown`. Status includes queued transfers, active byte progress, cache usage, account/quota metadata, mount state, and recent events. `settings.content_limit` accepts an integer byte allowance. `status.storage` contains allowance, used/available bytes, pending/retained/recovery totals, blocked/over-limit flags, and a bounded per-file explanation. Flutter polls status every two seconds; remote changes are independently polled by the engine.
+
+`import_file` accepts `source_path`, a relative destination `folder` (blank for root), and explicit `move_source: true` for Windows verified removal; it returns a durable job ID. `dismiss_import` accepts that `id` and refuses active transfers. `status.direct_uploads` reports jobs and pending original bytes separately from cache usage; capability flags let older UI/engine combinations degrade safely. `sqlite_query` accepts a relative cloud `path` and read-only `sql`, starts a worker and returns immediately. Poll `status.sqlite_query` for `running`, `complete` with bounded results, or `error`. SQLite result data and original source paths are excluded from the aggregate storage report.
 
 Diagnostics from PowerShell:
 
